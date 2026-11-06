@@ -1,0 +1,9 @@
+packages:
+  - apps/*
+  - protocol
+
+allowBuilds:
+  esbuild: true
+
+minimumReleaseAgeExclude:
+  - zustand@5.1.0

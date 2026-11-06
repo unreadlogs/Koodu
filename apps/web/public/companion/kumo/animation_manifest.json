@@ -1,0 +1,78 @@
+
+{
+  "character": "panda",
+  "animations": {
+    "idle": {
+      "file": "idle.png",
+      "frameCount": 6,
+      "frameWidth": 512,
+      "frameHeight": 512,
+      "fps": 8,
+      "loop": true
+    },
+    "listening": {
+      "file": "listening.png",
+      "frameCount": 5,
+      "frameWidth": 512,
+      "frameHeight": 512,
+      "fps": 6,
+      "loop": true
+    },
+    "thinking": {
+      "file": "thinking.png",
+      "frameCount": 6,
+      "frameWidth": 512,
+      "frameHeight": 512,
+      "fps": 6,
+      "loop": true
+    },
+    "working": {
+      "file": "working.png",
+      "frameCount": 6,
+      "frameWidth": 512,
+      "frameHeight": 512,
+      "fps": 8,
+      "loop": true
+    },
+    "talking": {
+      "file": "talking.png",
+      "frameCount": 6,
+      "frameWidth": 512,
+      "frameHeight": 512,
+      "fps": 10,
+      "loop": true
+    },
+    "happy": {
+      "file": "happy.png",
+      "frameCount": 6,
+      "frameWidth": 512,
+      "frameHeight": 512,
+      "fps": 10,
+      "loop": false
+    },
+    "confused": {
+      "file": "confused.png",
+      "frameCount": 4,
+      "frameWidth": 512,
+      "frameHeight": 512,
+      "fps": 5,
+      "loop": true
+    },
+    "error": {
+      "file": "error.png",
+      "frameCount": 4,
+      "frameWidth": 512,
+      "frameHeight": 512,
+      "fps": 6,
+      "loop": false
+    },
+    "sleeping": {
+      "file": "sleeping.png",
+      "frameCount": 6,
+      "frameWidth": 512,
+      "frameHeight": 512,
+      "fps": 5,
+      "loop": true
+    }
+  }
+}

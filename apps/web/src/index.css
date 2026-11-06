@@ -1,0 +1,87 @@
+@import 'tailwindcss';
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-slate-950 text-slate-100 antialiased;
+    font-family:
+      ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  }
+
+  ::selection {
+    @apply bg-emerald-400/30;
+  }
+}
+
+@keyframes pet-bob {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-6px);
+  }
+}
+
+@keyframes pet-sway {
+  0%,
+  100% {
+    transform: rotate(-3deg);
+  }
+  50% {
+    transform: rotate(3deg);
+  }
+}
+
+@keyframes pet-work {
+  0%,
+  100% {
+    transform: translateY(0) rotate(0deg);
+  }
+  25% {
+    transform: translateY(-3px) rotate(-4deg);
+  }
+  75% {
+    transform: translateY(-3px) rotate(4deg);
+  }
+}
+
+@keyframes pet-sleep {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(0.97);
+  }
+}
+
+.pet-bob {
+  animation: pet-bob 2.6s ease-in-out infinite;
+}
+
+.pet-sway {
+  animation: pet-sway 1.8s ease-in-out infinite;
+}
+
+.pet-work {
+  animation: pet-work 0.8s ease-in-out infinite;
+}
+
+.pet-sleep {
+  animation: pet-sleep 3.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pet-bob,
+  .pet-sway,
+  .pet-work,
+  .pet-sleep {
+    animation: none;
+  }
+}

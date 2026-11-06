@@ -1,0 +1,27 @@
+{
+  "name": "koodu",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "packageManager": "pnpm@12.16.1",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "dev": "pnpm --parallel --filter \"./apps/*\" dev",
+    "dev:web": "pnpm --filter @koodu/web dev",
+    "dev:server": "pnpm --filter @koodu/server dev",
+    "models:download": "node scripts/download-model.mjs",
+    "typecheck": "pnpm -r typecheck",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "pnpm -r build",
+    "verify": "pnpm typecheck && pnpm test && pnpm --filter @koodu/web build",
+    "assets:validate": "node scripts/validate-assets.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.1",
+    "typescript": "^5.7.3",
+    "vitest": "^5.1.0"
+  }
+}

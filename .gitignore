@@ -1,0 +1,14 @@
+node_modules/
+dist/
+coverage/
+.vite/
+*.tsbuildinfo
+.env
+.env.local
+*.log
+models/
+*.cact
+assets/models/
+.DS_Store
+AGENTS.md
+MEMORY.md
