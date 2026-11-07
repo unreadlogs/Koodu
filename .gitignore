@@ -6,9 +6,10 @@ coverage/
 .env
 .env.local
 *.log
-models/
-*.cact
-assets/models/
 .DS_Store
 AGENTS.md
 MEMORY.md
+apps/web/public/companion/
+apps/server/public/companion/
+temp/
+.gitignore

@@ -19,6 +19,7 @@ const chatCompletionSchema = z.object({
   choices: z
     .array(z.object({ message: z.object({ content: z.string() }) }))
     .min(1),
+  usage: z.object({ total_tokens: z.number().int().nonnegative().optional() }).optional(),
 });
 
 export interface OpenAiRuntimeOptions {
@@ -28,12 +29,13 @@ export interface OpenAiRuntimeOptions {
   model: string;
   apiKey?: string | null;
   timeoutMs?: number;
+  maxOutputTokens?: number;
   fetchImpl?: typeof fetch;
 }
 
 /**
  * Any OpenAI-compatible runtime works (llama.cpp server, Ollama, vLLM).
- * This is the transport for Cactus Needle 3 running server-side.
+ * Any OpenAI-compatible runtime (Ollama, llama.cpp, vLLM) works.
  */
 export function createOpenAiRuntime(options: OpenAiRuntimeOptions): InferenceRuntime {
   const doFetch = options.fetchImpl ?? globalThis.fetch;
@@ -76,7 +78,7 @@ export function createOpenAiRuntime(options: OpenAiRuntimeOptions): InferenceRun
             body: JSON.stringify({
               model: options.model,
               temperature: 0,
-              max_tokens: 300,
+              max_tokens: options.maxOutputTokens ?? 300,
               response_format: { type: 'json_object' },
               messages: [
                 { role: 'system', content: buildSystemPrompt(options.kind) },
@@ -101,7 +103,7 @@ export function createOpenAiRuntime(options: OpenAiRuntimeOptions): InferenceRun
         }
 
         const content = completion.data.choices[0]?.message.content ?? '';
-        return parseModelOutput(content, options);
+        return parseModelOutput(content, options, completion.data.usage?.total_tokens);
       } catch (error) {
         if (error instanceof InferenceError) throw error;
         if (error instanceof Error && error.name === 'AbortError') {
@@ -125,6 +127,7 @@ export function createOpenAiRuntime(options: OpenAiRuntimeOptions): InferenceRun
 export function parseModelOutput(
   content: string,
   options: { id: string; kind: 'local' | 'cloud' },
+  totalTokens?: number,
 ): InferenceResponse {
   let decoded: unknown;
   try {
@@ -145,6 +148,7 @@ export function parseModelOutput(
       confidence: 0,
       proposal: null,
       reply: 'That action needs cloud reasoning and your approval.',
+      ...(totalTokens === undefined ? {} : { usage: { totalTokens } }),
     };
   }
 
@@ -153,6 +157,7 @@ export function parseModelOutput(
     confidence: parsed.data.confidence,
     proposal: action ? { action, args: parsed.data.args } : null,
     reply: parsed.data.reply,
+    ...(totalTokens === undefined ? {} : { usage: { totalTokens } }),
   };
 }
 

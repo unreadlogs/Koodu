@@ -48,7 +48,7 @@
       "frameWidth": 512,
       "frameHeight": 512,
       "fps": 10,
-      "loop": false
+      "loop": true
     },
     "confused": {
       "file": "confused.png",

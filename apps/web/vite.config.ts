@@ -1,31 +1,14 @@
-import { fileURLToPath, URL } from 'node:url';
-import tailwindcss from '@tailwindcss/vite';
-import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vite';
-
-const contracts = fileURLToPath(
-  new URL('../../protocol/src/index.ts', import.meta.url),
-);
+import react from '@vitejs/plugin-react';
 
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
-  resolve: {
-    alias: {
-      '@koodu/protocol': contracts,
-    },
-  },
+  plugins: [react()],
   server: {
     port: 5173,
     strictPort: true,
     proxy: {
-      '/api': {
-        target: 'http://127.0.0.1:8787',
-        changeOrigin: false,
-      },
+      '/api': 'http://127.0.0.1:8787',
+      '/ws': { target: 'ws://127.0.0.1:8787', ws: true },
     },
-  },
-  build: {
-    outDir: 'dist',
-    sourcemap: true,
   },
 });

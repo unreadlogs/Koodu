@@ -8,6 +8,7 @@ import {
   petEmotionSchema,
   petModeSchema,
   tabWindowStateSchema,
+  workspaceLayoutSchema,
 } from './state';
 
 export const EVENT_VERSION = 1 as const;
@@ -39,9 +40,11 @@ export const EVENT_TYPES = [
   'workspace.tab.activated',
   'workspace.tab.window',
   'workspace.tab.pinned',
+  'workspace.layout.changed',
   'pet.activity.changed',
   'pet.emotion.changed',
   'pet.mode.changed',
+  'pet.position.changed',
   'agent.task.created',
   'agent.task.updated',
   'intelligence.status',
@@ -104,9 +107,14 @@ export const eventPayloadSchemas = {
     windowState: tabWindowStateSchema,
   }),
   'workspace.tab.pinned': z.object({ tabId: z.string().min(1), pinned: z.boolean() }),
+  'workspace.layout.changed': z.object({
+    layout: workspaceLayoutSchema,
+    splitTabId: z.string().min(1).nullable(),
+  }),
   'pet.activity.changed': z.object({ from: petActivitySchema, to: petActivitySchema }),
   'pet.emotion.changed': z.object({ from: petEmotionSchema, to: petEmotionSchema }),
   'pet.mode.changed': z.object({ from: petModeSchema, to: petModeSchema }),
+  'pet.position.changed': z.object({ x: z.number(), y: z.number() }),
   'agent.task.created': z.object({
     taskId: z.string().min(1),
     agentType: agentTypeSchema,

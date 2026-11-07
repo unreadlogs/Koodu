@@ -21,7 +21,7 @@ app
   .then((address) => {
     console.log(`[koodu-server] listening on ${address}`);
     console.log(
-      `[koodu-server] local model: ${config.local.model} (${config.local.provider ?? 'disabled'})`,
+      `[koodu-server] local model: ${config.local.model} (${config.local.baseUrl ? 'configured' : 'disabled'})`,
     );
     console.log(
       `[koodu-server] cloud model: ${config.cloud.model} (${config.cloud.baseUrl ? 'configured' : 'disabled'})`,

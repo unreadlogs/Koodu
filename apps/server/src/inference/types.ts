@@ -15,6 +15,7 @@ export interface InferenceResponse {
   confidence: number;
   proposal: InferenceProposal | null;
   reply: string | null;
+  usage?: { totalTokens?: number };
 }
 
 export type InferenceErrorCode =

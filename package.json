@@ -8,19 +8,19 @@
     "node": ">=22.18.0"
   },
   "scripts": {
-    "dev": "pnpm --parallel --filter \"./apps/*\" dev",
+    "dev": "concurrently --names server,web --kill-others --kill-others-on-fail --kill-signal SIGINT --kill-timeout 5000 \"pnpm dev:server\" \"pnpm dev:web\"",
     "dev:web": "pnpm --filter @koodu/web dev",
     "dev:server": "pnpm --filter @koodu/server dev",
-    "models:download": "node scripts/download-model.mjs",
+    "assets:sync": "node scripts/sync-assets.mjs",
     "typecheck": "pnpm -r typecheck",
     "test": "vitest run",
     "test:watch": "vitest",
     "build": "pnpm -r build",
-    "verify": "pnpm typecheck && pnpm test && pnpm --filter @koodu/web build",
-    "assets:validate": "node scripts/validate-assets.mjs"
+    "verify": "pnpm typecheck && pnpm test && pnpm --filter @koodu/web build"
   },
   "devDependencies": {
     "@types/node": "^22.13.1",
+    "concurrently": "^10.0.6",
     "typescript": "^5.7.3",
     "vitest": "^5.1.0"
   }

@@ -12,6 +12,9 @@ export const ACTION_NAMES = [
   'restore_workspace',
   'switch_pet_mode',
   'set_pet_emotion',
+  'set_pet_position',
+  'pin_tab',
+  'set_split',
   'get_active_tab',
   'get_task_status',
   'cancel_task',
@@ -39,6 +42,15 @@ export const actionArgsSchemas = {
   restore_workspace: z.object({}).strict(),
   switch_pet_mode: z.object({ mode: petModeSchema }).strict(),
   set_pet_emotion: z.object({ emotion: petEmotionSchema }).strict(),
+  /** Sanity bounds live here; the UI clamps to the actual viewport before dispatching. */
+  set_pet_position: z
+    .object({
+      x: z.number().min(0).max(100_000),
+      y: z.number().min(0).max(100_000),
+    })
+    .strict(),
+  pin_tab: z.object(tabTargetShape).strict(),
+  set_split: z.object({ tabId: z.string().min(1).nullable() }).strict(),
   get_active_tab: z.object({}).strict(),
   get_task_status: z.object({ taskId: z.string().min(1).optional() }).strict(),
   cancel_task: z.object({ taskId: z.string().min(1) }).strict(),
@@ -101,6 +113,22 @@ export const ACTION_POLICIES: Record<ActionName, ActionPolicy> = {
     risk: 'safe',
     localAllowed: true,
     description: 'Set an explicit pet emotion.',
+  },
+  set_pet_position: {
+    risk: 'safe',
+    localAllowed: true,
+    description: 'Move the floating pet on screen.',
+  },
+  pin_tab: {
+    risk: 'safe',
+    localAllowed: true,
+    description: 'Pin or unpin a tab. Pinned tabs stay in the strip.',
+  },
+  set_split: {
+    risk: 'safe',
+    localAllowed: true,
+    description:
+      'Toggle split view: pass a tab id to split the workspace with it, or null to close split.',
   },
   get_active_tab: {
     risk: 'safe',

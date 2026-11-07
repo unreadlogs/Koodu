@@ -1,5 +1,4 @@
 export interface ProviderConfig {
-  provider: 'openai' | 'needle' | null;
   baseUrl: string | null;
   model: string;
   apiKey: string | null;
@@ -13,11 +12,9 @@ export interface ServerConfig {
   auth: {
     password: string | null;
   };
-  local: ProviderConfig & {
-    needleModelPath: string | null;
-    needleCacheDir: string | null;
-  };
+  local: ProviderConfig;
   cloud: ProviderConfig;
+  publicDir: string;
 }
 
 const nonEmpty = (value: string | undefined): string | null => {
@@ -25,13 +22,13 @@ const nonEmpty = (value: string | undefined): string | null => {
   return trimmed && trimmed.length > 0 ? trimmed : null;
 };
 
-function localProvider(env: Record<string, string | undefined>): ProviderConfig['provider'] {
+function localProvider(env: Record<string, string | undefined>): boolean {
   const raw = nonEmpty(env.LOCAL_LLM_PROVIDER)?.toLowerCase() ?? null;
-  if (raw === null) return nonEmpty(env.LOCAL_LLM_BASE_URL) ? 'openai' : null;
-  if (['needle', 'openai'].includes(raw)) return raw as 'needle' | 'openai';
-  if (['off', 'none', 'disabled'].includes(raw)) return null;
+  if (raw === null) return Boolean(nonEmpty(env.LOCAL_LLM_BASE_URL));
+  if (['openai'].includes(raw)) return true;
+  if (['off', 'none', 'disabled'].includes(raw)) return false;
   throw new Error(
-    `Invalid LOCAL_LLM_PROVIDER "${raw}". Use "needle", "openai" or omit it to disable local inference.`,
+    `Invalid LOCAL_LLM_PROVIDER "${raw}". Use "openai" or omit it to disable local inference.`,
   );
 }
 
@@ -48,20 +45,15 @@ export function readConfig(env: Record<string, string | undefined> = process.env
       password: nonEmpty(env.KOODU_AUTH_PASSWORD),
     },
     local: {
-      provider: localProvider(env),
       baseUrl: nonEmpty(env.LOCAL_LLM_BASE_URL),
-      model:
-        nonEmpty(env.LOCAL_LLM_MODEL) ??
-        (nonEmpty(env.LOCAL_LLM_PROVIDER)?.toLowerCase() === 'needle' ? 'needle3' : 'needle'),
+      model: nonEmpty(env.LOCAL_LLM_MODEL) ?? 'local-model',
       apiKey: nonEmpty(env.LOCAL_LLM_API_KEY),
-      needleModelPath: nonEmpty(env.NEEDLE_MODEL_PATH),
-      needleCacheDir: nonEmpty(env.NEEDLE_CACHE_DIR),
     },
     cloud: {
-      provider: nonEmpty(env.CLOUD_LLM_BASE_URL) ? 'openai' : null,
       baseUrl: nonEmpty(env.CLOUD_LLM_BASE_URL),
       model: nonEmpty(env.CLOUD_LLM_MODEL) ?? 'cloud-model',
       apiKey: nonEmpty(env.CLOUD_LLM_API_KEY),
     },
+    publicDir: nonEmpty(env.SERVER_PUBLIC_DIR) ?? 'public',
   };
 }

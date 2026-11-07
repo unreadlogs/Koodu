@@ -15,7 +15,7 @@ describe('parseModelOutput', () => {
   it('accepts a minimal valid proposal', () => {
     const result = parseModelOutput(
       '{"action":"open_tab","args":{"route":"/workspace/usage"},"confidence":0.9,"reply":"ok"}',
-      { id: 'needle', kind: 'local' },
+      { id: 'local-model', kind: 'local' },
     );
     expect(result.proposal).toEqual({ action: 'open_tab', args: { route: '/workspace/usage' } });
     expect(result.confidence).toBe(0.9);
@@ -24,7 +24,7 @@ describe('parseModelOutput', () => {
   it('strips markdown fences and surrounding prose', () => {
     const result = parseModelOutput(
       'Sure!\n```json\n{"action":"get_active_tab","args":{},"confidence":0.8,"reply":null}\n```',
-      { id: 'needle', kind: 'local' },
+      { id: 'local-model', kind: 'local' },
     );
     expect(result.proposal?.action).toBe('get_active_tab');
   });
@@ -32,7 +32,7 @@ describe('parseModelOutput', () => {
   it('treats action=null as no proposal', () => {
     const result = parseModelOutput(
       '{"action":null,"args":{},"confidence":0.1,"reply":"Not sure."}',
-      { id: 'needle', kind: 'local' },
+      { id: 'local-model', kind: 'local' },
     );
     expect(result.proposal).toBeNull();
     expect(result.reply).toBe('Not sure.');
@@ -40,17 +40,17 @@ describe('parseModelOutput', () => {
 
   it('rejects unknown actions and malformed json', () => {
     expect(() =>
-      parseModelOutput('{"action":"format_disk","args":{}}', { id: 'needle', kind: 'local' }),
+      parseModelOutput('{"action":"format_disk","args":{}}', { id: 'local-model', kind: 'local' }),
     ).toThrow(/bad_shape/);
     expect(() =>
-      parseModelOutput('not json at all', { id: 'needle', kind: 'local' }),
+      parseModelOutput('not json at all', { id: 'local-model', kind: 'local' }),
     ).toThrow(/not_json/);
   });
 
   it('drops cloud-only actions proposed by the local model', () => {
     const result = parseModelOutput(
       '{"action":"spawn_subagent","args":{"agentType":"coding","task":"x"},"confidence":1}',
-      { id: 'needle', kind: 'local' },
+      { id: 'local-model', kind: 'local' },
     );
     expect(result.proposal).toBeNull();
     expect(result.reply).toMatch(/approval/);
@@ -71,7 +71,7 @@ describe('openai runtime', () => {
       id: 'local',
       kind: 'local',
       baseUrl: null,
-      model: 'needle',
+      model: 'local-model',
     });
     expect(runtime.configured()).toBe(false);
     await expect(runtime.complete({ text: 'hi', context: {} })).rejects.toMatchObject({
@@ -91,14 +91,14 @@ describe('openai runtime', () => {
       id: 'local',
       kind: 'local',
       baseUrl: 'http://127.0.0.1:11434/v1/',
-      model: 'needle',
+      model: 'local-model',
       fetchImpl,
     });
 
     const result = await runtime.complete({ text: 'open models', context: { tabs: [] } });
     expect(result.proposal?.action).toBe('open_tab');
     expect(captured?.url).toBe('http://127.0.0.1:11434/v1/chat/completions');
-    expect((captured?.body as { model: string }).model).toBe('needle');
+    expect((captured?.body as { model: string }).model).toBe('local-model');
   });
 
   it('maps upstream failures to http_error', async () => {
@@ -128,7 +128,7 @@ describe('openai runtime', () => {
       id: 'local',
       kind: 'local',
       baseUrl: 'http://127.0.0.1:1/v1',
-      model: 'needle',
+      model: 'local-model',
       timeoutMs: 5,
       fetchImpl: hanging,
     });
@@ -174,10 +174,10 @@ describe('server routes', () => {
     const fake: InferenceRuntime = {
       id: 'local',
       kind: 'local',
-      model: 'needle',
+      model: 'local-model',
       configured: () => true,
       complete: async () => ({
-        provider: 'needle',
+        provider: 'local-model',
         confidence: 0.9,
         proposal: { action: 'open_tab', args: { route: '/workspace/usage' } },
         reply: 'opening',

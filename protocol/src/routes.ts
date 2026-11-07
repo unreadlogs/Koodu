@@ -5,6 +5,8 @@ export const WORKSPACE_ROUTES = [
   '/workspace/models',
   '/workspace/agents',
   '/workspace/memory',
+  '/workspace/logs',
+  '/workspace/skills',
   '/workspace/settings',
 ] as const;
 
@@ -21,6 +23,8 @@ export const WORKSPACE_ROUTE_META: Record<WorkspaceRoute, WorkspaceRouteMeta> = 
   '/workspace/models': { title: 'Models', hint: 'Inference providers and models' },
   '/workspace/agents': { title: 'Agents', hint: 'Tasks and sub-agents' },
   '/workspace/memory': { title: 'Memory', hint: 'Persistent context' },
+  '/workspace/logs': { title: 'Logs', hint: 'Workspace events and diagnostics' },
+  '/workspace/skills': { title: 'Skills', hint: 'Reusable agent instructions' },
   '/workspace/settings': { title: 'Settings', hint: 'Workspace and pet options' },
 };
 
