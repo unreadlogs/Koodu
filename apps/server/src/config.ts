@@ -15,6 +15,7 @@ export interface ServerConfig {
   local: ProviderConfig;
   cloud: ProviderConfig;
   publicDir: string;
+  databasePath: string;
 }
 
 const nonEmpty = (value: string | undefined): string | null => {
@@ -33,13 +34,18 @@ function localProvider(env: Record<string, string | undefined>): boolean {
 }
 
 export function readConfig(env: Record<string, string | undefined> = process.env): ServerConfig {
+  const allowedOrigins = (env.ALLOWED_ORIGINS ?? 'http://localhost:5173,http://127.0.0.1:5173')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter((origin) => origin.length > 0);
+  if (env.CODESPACE_NAME) {
+    const forwardingDomain = env.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN ?? 'app.github.dev';
+    allowedOrigins.push(`https://${env.CODESPACE_NAME}-5173.${forwardingDomain}`);
+  }
   return {
     port: Number.parseInt(env.PORT ?? '8787', 10) || 8787,
     host: env.HOST ?? '127.0.0.1',
-    allowedOrigins: (env.ALLOWED_ORIGINS ?? 'http://localhost:5173,http://127.0.0.1:5173')
-      .split(',')
-      .map((origin) => origin.trim())
-      .filter((origin) => origin.length > 0),
+    allowedOrigins: [...new Set(allowedOrigins)],
     timeoutMs: Number.parseInt(env.LLM_TIMEOUT_MS ?? '15000', 10) || 15000,
     auth: {
       password: nonEmpty(env.KOODU_AUTH_PASSWORD),
@@ -55,5 +61,6 @@ export function readConfig(env: Record<string, string | undefined> = process.env
       apiKey: nonEmpty(env.CLOUD_LLM_API_KEY),
     },
     publicDir: nonEmpty(env.SERVER_PUBLIC_DIR) ?? 'public',
+    databasePath: nonEmpty(env.KOODU_DATABASE_PATH) ?? 'assets/database/koodu.sqlite',
   };
 }

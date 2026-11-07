@@ -10,9 +10,12 @@ import {
 } from '@hugeicons/core-free-icons';
 import { AGENT_DESCRIPTORS, AGENT_TYPES, type AgentType } from '@koodu/protocol';
 import type { WorkspaceRoute } from '@koodu/protocol';
+import { kooduSocket, type SocketState } from '../lib/socket';
+import { usePetController } from '../pet/pet-controller';
 
 type PetActivity = 'idle' | 'listening' | 'thinking' | 'working' | 'talking' | 'happy' | 'confused' | 'error' | 'sleeping';
 type Animation = { file: string; frameCount: number; frameWidth: number; frameHeight: number; fps: number; loop: boolean };
+const fallbackIdleAnimation: Animation = { file: 'idle.png', frameCount: 6, frameWidth: 512, frameHeight: 512, fps: 8, loop: true };
 type StartupPage = '/' | WorkspaceRoute;
 type AppPreferences = { animateCompanion: boolean; showCommandHint: boolean; startupPage: StartupPage };
 const PREFERENCES_KEY = 'koodu:settings:v1';
@@ -87,59 +90,30 @@ function useRoute() {
 }
 
 function useRealtime() {
-  const [status, setStatus] = useState<'connecting' | 'online' | 'offline'>('connecting');
-  const [ping, setPing] = useState<number | null>(null);
+  const [snapshot, setSnapshot] = useState(kooduSocket.snapshot);
   useEffect(() => {
-    let socket: WebSocket | null = null;
-    let retry: number | undefined;
-    let heartbeat: number | undefined;
-    let stopped = false;
-    const pending = new Map<string, number>();
-    const connect = () => {
-      if (stopped) return;
-      setStatus('connecting');
-      socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
-      socket.onopen = () => {
-        setStatus('online');
-        appendLog('connection', 'WebSocket connected', 'Central workspace connection established.', 'success');
-        socket?.send(JSON.stringify({ type: 'hello', at: Date.now() }));
-        const sendPing = () => {
-          if (socket?.readyState !== WebSocket.OPEN) return;
-          const id = crypto.randomUUID();
-          const at = Date.now();
-          pending.set(id, performance.now());
-          socket.send(JSON.stringify({ type: 'ping', id, at }));
-          window.setTimeout(() => pending.delete(id), 10_000);
-        };
-        sendPing();
-        heartbeat = window.setInterval(sendPing, 5000);
-      };
-      socket.onmessage = (event) => {
-        try {
-          const message = JSON.parse(String(event.data)) as { type?: string; id?: string };
-          if (message.type === 'pong' && message.id) {
-            const sent = pending.get(message.id);
-            if (sent !== undefined) { setPing(Math.max(0, Math.round(performance.now() - sent))); pending.delete(message.id); }
-          }
-        } catch { /* Ignore malformed server messages. */ }
-      };
-      socket.onerror = () => socket?.close();
-      socket.onclose = () => {
-        if (heartbeat !== undefined) window.clearInterval(heartbeat);
-        setStatus('offline');
-        appendLog('connection', 'WebSocket disconnected', 'The client will retry automatically.', 'warning');
-        if (!stopped) retry = window.setTimeout(connect, 1800);
-      };
+    let previous: SocketState | null = null;
+    const update = () => {
+      const next = kooduSocket.snapshot;
+      setSnapshot(next);
+      if (next.state !== previous) {
+        if (next.state === 'online') appendLog('connection', 'WebSocket connected', 'Central application data connection established.', 'success');
+        if (next.state === 'offline') appendLog('connection', 'WebSocket disconnected', 'The client will retry automatically.', 'warning');
+        previous = next.state;
+      }
     };
-    connect();
+    kooduSocket.connect();
+    const unsubscribe = kooduSocket.subscribe(update);
+    update();
+    // Temporarily disable client heartbeat frames while inspecting application RPC traffic.
+    // kooduSocket.ping();
+    // const heartbeat = window.setInterval(() => kooduSocket.ping(), 5000);
     return () => {
-      stopped = true;
-      if (retry !== undefined) window.clearTimeout(retry);
-      if (heartbeat !== undefined) window.clearInterval(heartbeat);
-      socket?.close();
+      // window.clearInterval(heartbeat);
+      unsubscribe();
     };
   }, []);
-  return { status, ping };
+  return { ...snapshot, status: snapshot.state };
 }
 
 function App() {
@@ -148,7 +122,8 @@ function App() {
   const currentPage = pageFromPath(path);
   const [character, setCharacter] = useState<'kumo' | 'kitsu'>(() => localStorage.getItem('koodu:companion') === 'kitsu' ? 'kitsu' : 'kumo');
   const [preferences, setPreferences] = useState<AppPreferences>(readPreferences);
-  const [activity, setActivity] = useState<PetActivity>('idle');
+  const activity = usePetController((state) => state.activity);
+  const dispatchPetAction = usePetController((state) => state.dispatchAction);
   const [animations, setAnimations] = useState<Record<string, Animation>>({});
   const [command, setCommand] = useState('');
   const [feedback, setFeedback] = useState('');
@@ -163,8 +138,7 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch(`/companion/${character}/animation_manifest.json`)
-      .then((response) => response.ok ? response.json() : null)
+    kooduSocket.request<{ animations?: Record<string, Animation> } & Record<string, Animation>>('companion.manifest', { character })
       .then((manifest) => {
         if (!cancelled) setAnimations(manifest?.animations ?? manifest ?? {});
       })
@@ -181,18 +155,18 @@ function App() {
     if (!text) return;
     appendLog('command', 'Command received', text);
     setCommand('');
-    setActivity('thinking');
+    dispatchPetAction('think');
     const requested = pages.find((page) => text.toLowerCase().includes(page.label.toLowerCase()));
     window.setTimeout(() => {
       if (requested) {
         navigate(requested.route);
         setFeedback(`Opening ${requested.label}`);
-        setActivity('happy');
+        dispatchPetAction('celebrate');
       } else {
         setFeedback('Try a page name: Usage, Models, Agents, Memory, Logs, Skills, or Settings.');
-        setActivity('talking');
+        dispatchPetAction('speak');
       }
-      window.setTimeout(() => { setActivity('idle'); setFeedback(''); }, 2200);
+      window.setTimeout(() => { dispatchPetAction('reset'); setFeedback(''); }, 2200);
     }, 350);
   };
 
@@ -238,9 +212,9 @@ function HomePage({ activity, character, animations, animateCompanion }: { activ
 }
 
 function PetCharacter({ activity, character, animations, animate }: { activity: PetActivity; character: 'kumo' | 'kitsu'; animations: Record<string, Animation>; animate: boolean }) {
-  const animation = animations[activity] ?? animations.idle;
+  const animation = animations[activity] ?? animations.idle ?? fallbackIdleAnimation;
   return <div className="pet-character" title={`${character === 'kumo' ? 'Kumo' : 'Kitsu'} · ${activity}`}>
-    {animation ? <SpriteSheet key={`${character}-${activity}-${animation.file}`} character={character} animation={animation} animate={animate}/> : <img src={`/companion/${character}/idle.png`} alt="Koodu companion"/>}
+    <SpriteSheet key={`${character}-${activity}-${animation.file}`} character={character} animation={animation} animate={animate}/>
   </div>;
 }
 
@@ -289,24 +263,30 @@ const usagePreview: Record<UsageRange, { labels: string[]; requests: number[]; t
 };
 function UsagePage() {
   const [range, setRange] = useState<UsageRange>('7D');
-  const data = usagePreview[range];
+  const [usage, setUsage] = useState<{summary:{calls:number;tokens:number;latency:number;successRate:number};recent:Array<{id:string;occurred_at:number;model_id:string|null;provider:string|null;route:string;input_tokens:number;output_tokens:number;latency_ms:number;outcome:string}>;daily:Array<{day:string;calls:number;tokens:number}>}|null>(null);
+  const [error, setError] = useState('');
+  useEffect(() => { let live=true; setUsage(null); kooduSocket.request<any>('usage.summary',{range}).then(result=>{if(live){setUsage(result);setError('');}}).catch(reason=>{if(live)setError(reason instanceof Error?reason.message:'Usage data unavailable.');}); return ()=>{live=false;}; },[range]);
+  const summary=usage?.summary;
+  const labels=usage?.daily.map(row=>row.day)??[];
+  const maxCalls=Math.max(1,...(usage?.daily.map(row=>row.calls)??[]));
   const exportPreview = () => {
-    const csv = ['period,requests,tokens_index', ...data.labels.map((label,i)=>`${label},${data.requests[i]},${data.tokens[i]}`)].join('\n');
-    const url = URL.createObjectURL(new Blob([csv], {type:'text/csv'})); const anchor = document.createElement('a'); anchor.href=url; anchor.download=`koodu-usage-preview-${range.toLowerCase()}.csv`; anchor.click(); URL.revokeObjectURL(url);
+    const csv = ['date,requests,tokens', ...(usage?.daily??[]).map(row=>`${row.day},${row.calls},${row.tokens}`)].join('\n');
+    const url = URL.createObjectURL(new Blob([csv], {type:'text/csv'})); const anchor = document.createElement('a'); anchor.href=url; anchor.download=`koodu-usage-${range.toLowerCase()}.csv`; anchor.click(); URL.revokeObjectURL(url);
   };
+  const formatTime=(at:number)=>new Date(at).toLocaleString();
   return <div className="product-page usage-page">
     <div className="usage-toolbar"><div className="usage-window"><AppIcon icon={Clock01Icon} size={15}/><span>Activity window</span>{(['24H','7D','30D'] as UsageRange[]).map(option=><button key={option} className={range===option?'active':''} onClick={()=>setRange(option)}>{option}</button>)}</div><button className="product-secondary" onClick={exportPreview}><AppIcon icon={Download01Icon} size={14}/> Export CSV</button></div>
-    <div className="usage-preview-banner"><AppIcon icon={Activity01Icon} size={15}/><span><strong>Dashboard preview</strong> These illustrative metrics will be replaced by live request telemetry when model routing is connected.</span></div>
+    {error&&<div className="model-error">{error}</div>}
     <div className="usage-metric-grid">
-      <UsageMetric icon={ChartLineData01Icon} label="TOTAL REQUESTS" value={data.calls} delta="+12.8%" detail="vs previous period"/>
-      <UsageMetric icon={Coins01Icon} label="TOKENS PROCESSED" value={data.tokenTotal} delta="+8.2%" detail="input + output"/>
-      <UsageMetric icon={Clock01Icon} label="AVG. RESPONSE TIME" value={data.latency} delta="−4.1%" detail="median 840 ms"/>
-      <UsageMetric icon={Activity01Icon} label="SUCCESS RATE" value={data.success} delta="+0.6%" detail="1.3% failed or retried"/>
+      <UsageMetric icon={ChartLineData01Icon} label="TOTAL REQUESTS" value={(summary?.calls??0).toLocaleString()} delta="" detail="selected period"/>
+      <UsageMetric icon={Coins01Icon} label="TOKENS PROCESSED" value={(summary?.tokens??0).toLocaleString()} delta="" detail="input + output"/>
+      <UsageMetric icon={Clock01Icon} label="AVG. RESPONSE TIME" value={`${Math.round(summary?.latency??0)} ms`} delta="" detail="recorded requests"/>
+      <UsageMetric icon={Activity01Icon} label="SUCCESS RATE" value={`${(summary?.successRate??0).toFixed(1)}%`} delta="" detail="successful requests"/>
     </div>
-    <section className="usage-panel usage-chart-panel"><div className="usage-panel-heading"><div><strong>Request volume</strong><span>Completed requests across the selected period</span></div><div className="chart-legend"><i/> Requests <small>·</small> {range === '24H' ? 'Hourly' : range === '7D' ? 'Daily' : 'Weekly'}</div></div><div className="chart-area"><div className="chart-y-axis"><span>100</span><span>75</span><span>50</span><span>25</span><span>0</span></div><div className="chart-columns" style={{gridTemplateColumns:`repeat(${data.labels.length},minmax(0,1fr))`}}>{data.requests.map((value,index)=><div className="chart-column" key={data.labels[index]}><div className="chart-bar-track"><i className="chart-bar" style={{height:`${value}%`}}/><i className="chart-bar-secondary" style={{height:`${data.tokens[index]}%`}}/></div><span>{data.labels[index]}</span></div>)}</div></div><div className="chart-axis-caption"><span>ACTIVITY</span><span>Illustrative trend · index scale</span></div></section>
+    <section className="usage-panel usage-chart-panel"><div className="usage-panel-heading"><div><strong>Request volume</strong><span>Recorded requests · {range}</span></div></div><div className="chart-area"><div className="chart-y-axis"><span>{maxCalls}</span><span>{Math.round(maxCalls*.75)}</span><span>{Math.round(maxCalls*.5)}</span><span>{Math.round(maxCalls*.25)}</span><span>0</span></div><div className="chart-columns" style={{gridTemplateColumns:`repeat(${labels.length||1},minmax(0,1fr))`}}>{(usage?.daily??[]).map(row=><div className="chart-column" key={row.day}><div className="chart-bar-track"><i className="chart-bar" style={{height:`${row.calls/maxCalls*100}%`}}/></div><span>{row.day}</span></div>)}</div></div>{!usage?.daily.length&&<p>No requests recorded for this period.</p>}</section>
     <div className="usage-lower-grid"><section className="usage-panel breakdown-panel"><div className="usage-panel-heading"><div><strong>Usage by model</strong><span>Request share · preview distribution</span></div><button className="quiet-action">All models <AppIcon icon={ArrowUpRight01Icon} size={13}/></button></div>{[{name:'Local model',meta:'On-device · Koodu runtime',share:54,amount:'4,829',color:'green'},{name:'Cloud reasoning',meta:'Provider adapter · configured',share:33,amount:'2,951',color:'lavender'},{name:'Other requests',meta:'Embeddings and utilities',share:13,amount:'1,162',color:'blue'}].map(row=><div className="model-usage-row" key={row.name}><span className={`model-usage-mark ${row.color}`}/><div className="model-usage-copy"><strong>{row.name}</strong><small>{row.meta}</small><i><b className={row.color} style={{width:`${row.share}%`}}/></i></div><span className="model-usage-count"><strong>{row.amount}</strong><small>{row.share}%</small></span></div>)}</section>
       <section className="usage-panel activity-panel"><div className="usage-panel-heading"><div><strong>Recent activity</strong><span>Example request log</span></div><button className="quiet-action">View log <AppIcon icon={ArrowUpRight01Icon} size={13}/></button></div><div className="activity-table"><div className="activity-row activity-table-head"><span>REQUEST</span><span>MODEL</span><span>TIME</span><span>STATUS</span></div>{[['Summarize my recent notes','Local · Koodu','2m ago','Success'],['Compare model responses','Cloud · Reasoning','18m ago','Success'],['Open workspace usage','Local · Koodu','41m ago','Success'],['Organize project context','Cloud · Reasoning','1h ago','Retried']].map(([title,model,time,status])=><div className="activity-row" key={title}><span className="activity-request">{title}</span><span>{model}</span><span>{time}</span><span className={`activity-state ${status==='Success'?'ok':'retry'}`}><i/>{status}</span></div>)}</div></section></div>
-    <div className="usage-disclaimer">Usage accounting is planned. No real request, token, model, or latency measurements are collected by this preview.</div>
+    <div className="usage-disclaimer">Usage is calculated from server-recorded inference requests.</div>
   </div>;
 }
 function UsageMetric({icon,label,value,delta,detail}:{icon:IconSvgElement;label:string;value:string;delta:string;detail:string}) {
@@ -400,12 +380,12 @@ function ModelsPage(){
   const [notice,setNotice]=useState('');
   const [testing,setTesting]=useState<string|null>(null);
   const [testStatus,setTestStatus]=useState<Record<string,string>>({});
-  const load=()=>{setLoading(true);fetch('/api/model-profiles').then(async response=>{if(!response.ok)throw new Error(response.status===401?'Sign in to manage model profiles.':'Model profile service is unavailable.');const body=await response.json();setProfiles(Array.isArray(body.profiles)?body.profiles:[]);setError('');}).catch(reason=>setError(reason instanceof Error?reason.message:'Could not load model profiles.')).finally(()=>setLoading(false));};
+  const load=()=>{setLoading(true);kooduSocket.request<{profiles:ModelProfile[]}>('models.list',{}).then(body=>{setProfiles(Array.isArray(body.profiles)?body.profiles:[]);setError('');}).catch(reason=>setError(reason instanceof Error?reason.message:'Could not load model profiles.')).finally(()=>setLoading(false));};
   useEffect(()=>{load();},[]);
-  const save=async(value:Omit<ModelProfile,'apiKeySet'>&{apiKey?:string;clearApiKey?:boolean})=>{const response=await fetch(`/api/model-profiles/${encodeURIComponent(value.id)}`,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(value)});if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error==='invalid_model_profile'?'Check the model profile fields.':`Could not save profile (${response.status}).`);}setEditor(null);setNotice('Model profile saved securely on the server.');appendLog('models','Model profile saved',value.name,'success');load();};
-  const remove=async(profile:ModelProfile)=>{const response=await fetch(`/api/model-profiles/${encodeURIComponent(profile.id)}`,{method:'DELETE'});if(response.ok){setProfiles(items=>items.filter(item=>item.id!==profile.id));setNotice(`${profile.name} removed.`);appendLog('models','Model profile removed',profile.name,'warning');}};
+  const save=async(value:Omit<ModelProfile,'apiKeySet'>&{apiKey?:string;clearApiKey?:boolean})=>{await kooduSocket.request('models.save',value);setEditor(null);setNotice('Model profile saved securely on the server.');appendLog('models','Model profile saved',value.name,'success');load();};
+  const remove=async(profile:ModelProfile)=>{try{await kooduSocket.request('models.delete',{id:profile.id});setProfiles(items=>items.filter(item=>item.id!==profile.id));setNotice(`${profile.name} removed.`);appendLog('models','Model profile removed',profile.name,'warning');}catch(reason){setError(reason instanceof Error?reason.message:'Could not remove profile.');}};
   const activate=async(profile:ModelProfile)=>{try{await save({...profile,active:true,enabled:true});setNotice(`${profile.name} is now the active ${profile.role} profile.`);}catch(reason){setError(reason instanceof Error?reason.message:'Could not activate profile.');}};
-  const test=async(profile:ModelProfile)=>{setTesting(profile.id);setTestStatus(current=>({...current,[profile.id]:''}));try{const response=await fetch(`/api/model-profiles/${encodeURIComponent(profile.id)}/test`,{method:'POST'});const body=await response.json().catch(()=>({}));if(!response.ok)throw new Error(body.error==='api_key_missing'?'Add an API key first.':body.error==='provider_unreachable'?'Provider endpoint could not be reached.':`Provider returned ${body.status??response.status}.`);setTestStatus(current=>({...current,[profile.id]:'Connected'}));}catch(reason){setTestStatus(current=>({...current,[profile.id]:reason instanceof Error?reason.message:'Connection failed.'}));}finally{setTesting(null);}};
+  const test=async(profile:ModelProfile)=>{setTesting(profile.id);setTestStatus(current=>({...current,[profile.id]:''}));try{await kooduSocket.request('models.test',{id:profile.id});setTestStatus(current=>({...current,[profile.id]:'Connected'}));}catch(reason){const message=reason instanceof Error?reason.message:'Connection failed.';setTestStatus(current=>({...current,[profile.id]:message==='api_key_missing'?'Add an API key first.':message==='provider_unreachable'?'Provider endpoint could not be reached.':message}));}finally{setTesting(null);}};
   const create=()=>{setError('');setEditor({id:`model-${crypto.randomUUID().slice(0,8)}`,name:'',provider:'openai',model:'',baseUrl:providerUrls.openai,role:'cloud',maxOutputTokens:1024,monthlyTokenLimit:0,enabled:true,active:false,apiKeySet:false});};
   return <div className="product-page models-page">
     <div className="models-summary"><span className="models-summary-icon"><AppIcon icon={CpuIcon} size={19}/></span><div><strong>Model providers</strong><small>Add multiple provider profiles and choose which one handles each inference route.</small></div><span className="models-summary-count">{profiles.length} PROFILE{profiles.length===1?'':'S'}</span></div>
@@ -542,7 +522,7 @@ function CharacterOption({ id, selected, onSelect }: { id: 'kumo' | 'kitsu'; sel
   const [happy, setHappy] = useState<Animation | null>(null);
   useEffect(() => {
     let cancelled = false;
-    fetch(`/companion/${id}/animation_manifest.json`).then((response) => response.ok ? response.json() : null).then((manifest) => {
+    kooduSocket.request<{ animations?: Record<string, Animation> } & Record<string, Animation>>('companion.manifest', { character: id }).then((manifest) => {
       const animations = manifest?.animations ?? manifest;
       if (!cancelled && animations?.happy) setHappy(animations.happy as Animation);
     }).catch(() => {});

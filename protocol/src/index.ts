@@ -7,3 +7,4 @@ export * from './events';
 export * from './iframe';
 export * from './persistence';
 export * from './auth';
+export * from './rpc';

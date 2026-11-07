@@ -12,5 +12,15 @@ MEMORY.md
 apps/web/public/companion/
 apps/server/public/companion/
 .data/
+# SQLite databases and sidecar files (including WAL/journal files).
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.wal
+*.shm
+*.journal
 temp/
 .gitignore
