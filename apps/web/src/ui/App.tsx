@@ -3,10 +3,10 @@ import { HugeiconsIcon, type IconSvgElement } from '@hugeicons/react';
 import {
   AiSecurity02Icon, ArrowRight01Icon, CommandIcon, CpuIcon, DashboardSpeed01Icon,
   Home01Icon, Layers01Icon, Mic01Icon, Settings01Icon, ShieldCheckIcon, SparklesIcon,
-  Add01Icon, Cancel01Icon, Search01Icon, Delete02Icon, PinIcon, Clock01Icon, Tick02Icon,
+  Add01Icon, Cancel01Icon, Search01Icon, Delete02Icon, Clock01Icon, Tick02Icon, Edit01Icon,
   Activity01Icon, ArrowUpRight01Icon, ChartLineData01Icon, Coins01Icon, Download01Icon,
   FileSearchIcon, FilterIcon, Refresh01Icon, Delete01Icon,
-  PuzzleIcon, Edit01Icon, BookOpen01Icon, Upload01Icon,
+  PuzzleIcon, BookOpen01Icon, Upload01Icon,
 } from '@hugeicons/core-free-icons';
 import { AGENT_DESCRIPTORS, AGENT_TYPES, type AgentType } from '@koodu/protocol';
 import type { WorkspaceRoute } from '@koodu/protocol';
@@ -259,14 +259,13 @@ function SpriteSheet({ character, animation, size = 250, animate = true, loop }:
 }
 
 function ModulePage({ page, character, setCharacter, preferences, updatePreferences, connection }: { page: RoutePage; character: 'kumo' | 'kitsu'; setCharacter: (value: 'kumo' | 'kitsu') => void; preferences: AppPreferences; updatePreferences: (changes: Partial<AppPreferences>) => void; connection: { status: 'connecting' | 'online' | 'offline'; ping: number | null } }) {
-  const [memoryRefresh, setMemoryRefresh] = useState(0);
   return <div className={`module-page-content ${page.label === 'Settings' ? 'settings-page-content' : ''}`}>
     <div className="module-heading">
       <div><div className="eyebrow">KOODU / WORKSPACE / {page.label.toUpperCase()}</div><h1>{page.label}</h1><p>{page.subtitle}</p></div>
       <span className="module-page-icon"><AppIcon icon={page.icon} size={19}/></span>
     </div>
     {page.label === 'Settings' ? <SettingsPage character={character} setCharacter={setCharacter} preferences={preferences} updatePreferences={updatePreferences} connection={connection}/>
-    : page.label === 'Memory' ? <MemoryPage key={memoryRefresh} onUpdate={() => setMemoryRefresh((value) => value + 1)}/>
+    : page.label === 'Memory' ? <MemoryPage/>
     : page.label === 'Agents' ? <AgentsPage/>
     : page.label === 'Usage' ? <UsagePage/>
     : page.label === 'Logs' ? <LogsPage/>
@@ -426,32 +425,56 @@ function ModelEditor({value,onSave,onCancel,onError}:{value:ModelProfile;onSave:
   return <section className="model-editor"><div className="skill-editor-heading"><div><strong>{value.apiKeySet?'Edit provider profile':'Add provider profile'}</strong><small>Configure an OpenAI-compatible API endpoint for Koodu inference.</small></div><button aria-label="Close editor" onClick={onCancel}><AppIcon icon={Cancel01Icon} size={16}/></button></div><div className="model-form-grid"><label>Profile name<input value={draft.name} maxLength={80} onChange={e=>setDraft({...draft,name:e.target.value})} placeholder="e.g. OpenRouter · Fast model"/></label><label>Provider<select value={draft.provider} onChange={e=>updateProvider(e.target.value as ModelProvider)}>{Object.entries(providerNames).map(([id,name])=><option key={id} value={id}>{name}</option>)}</select></label><label>Model ID<input value={draft.model} onChange={e=>setDraft({...draft,model:e.target.value})} placeholder="Provider model identifier"/></label><label>API base URL<input value={draft.baseUrl} onChange={e=>setDraft({...draft,baseUrl:e.target.value})} placeholder="https://api.example.com/v1"/></label><label>Inference route<select value={draft.role} onChange={e=>setDraft({...draft,role:e.target.value as 'local'|'cloud',active:false})}><option value="cloud">Cloud reasoning</option><option value="local">Local inference</option></select></label><label>Max output tokens<input type="number" min={64} max={32768} step={64} value={draft.maxOutputTokens} onChange={e=>setDraft({...draft,maxOutputTokens:Number(e.target.value)})}/></label><label>Monthly token cap <small>0 means unlimited</small><input type="number" min={0} max={1000000000} step={1000} value={draft.monthlyTokenLimit} onChange={e=>setDraft({...draft,monthlyTokenLimit:Number(e.target.value)})}/></label><label>API key <small>{draft.apiKeySet&&!apiKey?'Saved on server · leave blank to keep':''}</small><input type="password" autoComplete="new-password" value={apiKey} onChange={e=>{setApiKey(e.target.value);setClearKey(false);}} placeholder={draft.apiKeySet?'Enter a new key to replace':'Paste provider API key'}/></label></div><div className="model-form-options"><label className="model-enabled-toggle"><input type="checkbox" checked={draft.enabled} onChange={e=>setDraft({...draft,enabled:e.target.checked,active:e.target.checked?draft.active:false})}/> Enabled</label>{draft.apiKeySet&&<label className="model-enabled-toggle"><input type="checkbox" checked={clearKey} onChange={e=>setClearKey(e.target.checked)}/> Remove saved key</label>}<label className="model-enabled-toggle"><input type="checkbox" checked={draft.active} onChange={e=>setDraft({...draft,active:e.target.checked,enabled:true})}/> Make active for this route</label></div><div className="model-editor-footer"><span>Compatible with OpenAI Chat Completions APIs. Google AI Studio’s OpenAI-compatible endpoint is supported.</span><div><button className="product-secondary" onClick={onCancel}>Cancel</button><button className="product-primary" disabled={saving||!draft.name.trim()||!draft.model.trim()||!draft.baseUrl.trim()||draft.maxOutputTokens<64||draft.monthlyTokenLimit<0} onClick={()=>void submit()}>{saving?<i className="tiny-spinner"/>:<AppIcon icon={Tick02Icon} size={14}/>} Save profile</button></div></div></section>;
 }
 
-type MemoryNote = { id: string; title: string; content: string; updatedAt: number; pinned: boolean };
+type MemoryNote = { id: string; content: string; category: 'preference' | 'fact' | 'task'; updatedAt: number };
+function estimateMemoryTokens(text: string): number {
+  const chunks = text.match(/[\p{L}\p{N}]+|[^\s]/gu) ?? [];
+  return chunks.reduce((total, chunk) => total + (/[^\x00-\x7f]/u.test(chunk) ? Array.from(chunk).length : /^[\p{L}\p{N}]+$/u.test(chunk) ? Math.ceil(chunk.length / 4) : 1), 0);
+}
+function boundMemoryText(text: string): string {
+  const normalized = text.normalize('NFKC').replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').replace(/\s+/g, ' ').trim();
+  let accepted = '';
+  for (const character of Array.from(normalized).slice(0, 350)) {
+    const candidate = accepted + character;
+    if (estimateMemoryTokens(candidate) > 128) break;
+    accepted = candidate;
+  }
+  if (accepted.length < normalized.length) {
+    const sentenceEnd = Math.max(accepted.lastIndexOf('.'), accepted.lastIndexOf('!'), accepted.lastIndexOf('?'));
+    if (sentenceEnd >= accepted.length * 0.5) return accepted.slice(0, sentenceEnd + 1).trim();
+    const wordEnd = accepted.lastIndexOf(' ');
+    if (wordEnd > 0) accepted = accepted.slice(0, wordEnd);
+  }
+  return accepted.trim();
+}
 function readLocalList<T>(key: string): T[] {
   try { const parsed = JSON.parse(localStorage.getItem(key) ?? '[]'); return Array.isArray(parsed) ? parsed as T[] : []; }
   catch { return []; }
 }
-function MemoryPage({ onUpdate }: { onUpdate: () => void }) {
-  const [notes, setNotes] = useState<MemoryNote[]>(() => readLocalList<MemoryNote>(MEMORY_KEY));
+function MemoryPage() {
+  const [notes, setNotes] = useState<MemoryNote[]>(() => readLocalList<MemoryNote>(MEMORY_KEY).filter((note) => note && typeof note.id === 'string' && typeof note.content === 'string' && ['preference','fact','task'].includes(note.category) && typeof note.updatedAt === 'number'));
   const [query, setQuery] = useState('');
   const [editing, setEditing] = useState<string | null>(null);
-  const [title, setTitle] = useState('');
   const [content, setContent] = useState('');
-  const persist = (next: MemoryNote[]) => { setNotes(next); localStorage.setItem(MEMORY_KEY, JSON.stringify(next)); onUpdate(); };
-  const startNew = () => { setEditing('new'); setTitle(''); setContent(''); };
+  const [category, setCategory] = useState<MemoryNote['category']>('fact');
+  const persist = (next: MemoryNote[]) => { setNotes(next); localStorage.setItem(MEMORY_KEY, JSON.stringify(next)); };
+  const startNew = () => { setEditing('new'); setContent(''); setCategory('fact'); };
+  const startEdit = (note: MemoryNote) => { setEditing(note.id); setContent(note.content); setCategory(note.category); };
   const save = () => {
-    const cleanTitle = title.trim(); const cleanContent = content.trim();
-    if (!cleanTitle || !cleanContent) return;
-    const note: MemoryNote = { id: editing === 'new' ? crypto.randomUUID() : editing!, title: cleanTitle, content: cleanContent, updatedAt: Date.now(), pinned: notes.find((item) => item.id === editing)?.pinned ?? false };
+    const cleanContent = boundMemoryText(content);
+    if (!cleanContent) return;
+    const note: MemoryNote = { id: editing === 'new' ? crypto.randomUUID() : editing!, content: cleanContent, category, updatedAt: Date.now() };
     persist(editing === 'new' ? [note, ...notes] : notes.map((item) => item.id === editing ? note : item)); setEditing(null);
+    appendLog('memory', editing === 'new' ? 'Memory saved' : 'Memory updated', category, 'success');
   };
-  const visible = notes.filter((note) => `${note.title} ${note.content}`.toLowerCase().includes(query.toLowerCase())).sort((a,b) => Number(b.pinned)-Number(a.pinned) || b.updatedAt-a.updatedAt);
+  const visible = notes.filter((note) => `${note.content} ${note.category}`.toLowerCase().includes(query.toLowerCase())).sort((a,b) => b.updatedAt-a.updatedAt);
+  const remove = (note: MemoryNote) => { persist(notes.filter((item) => item.id !== note.id)); appendLog('memory', 'Memory deleted', note.category, 'warning'); };
   return <div className="product-page memory-page">
     <div className="product-toolbar"><label className="product-search"><AppIcon icon={Search01Icon} size={16}/><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search saved memories"/></label><button className="product-primary" onClick={startNew}><AppIcon icon={Add01Icon} size={15}/> New memory</button></div>
-    <div className="local-data-banner"><span className="local-dot"/> Stored in this browser <span>·</span> Only Koodu can use these notes after a future memory integration.</div>
-    {editing !== null && <section className="memory-editor"><div className="editor-heading"><strong>{editing === 'new' ? 'New memory' : 'Edit memory'}</strong><button aria-label="Close editor" onClick={() => setEditing(null)}><AppIcon icon={Cancel01Icon} size={16}/></button></div><input className="memory-title-input" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Give this memory a title" maxLength={100}/><textarea value={content} onChange={(e) => setContent(e.target.value)} placeholder="Add useful context to remember…" rows={4}/><div className="editor-actions"><button className="product-secondary" onClick={() => setEditing(null)}>Cancel</button><button className="product-primary" disabled={!title.trim() || !content.trim()} onClick={save}><AppIcon icon={Tick02Icon} size={15}/> Save memory</button></div></section>}
-    {visible.length ? <div className="memory-grid">{visible.map((note) => <article className="memory-card" key={note.id}><div className="memory-card-top"><span className="memory-kind">{note.pinned ? <><AppIcon icon={PinIcon} size={12}/> PINNED</> : 'PERSONAL MEMORY'}</span><span className="memory-actions"><button title={note.pinned ? 'Unpin' : 'Pin'} aria-label={note.pinned ? 'Unpin memory' : 'Pin memory'} onClick={() => persist(notes.map((n) => n.id === note.id ? {...n,pinned:!n.pinned} : n))}><AppIcon icon={PinIcon} size={14}/></button><button title="Delete" aria-label="Delete memory" onClick={() => persist(notes.filter((n) => n.id !== note.id))}><AppIcon icon={Delete02Icon} size={14}/></button></span></div><button className="memory-card-body" onClick={() => {setEditing(note.id);setTitle(note.title);setContent(note.content);}}><strong>{note.title}</strong><span>{note.content}</span></button><div className="memory-card-footer"><span><AppIcon icon={Clock01Icon} size={12}/>{new Date(note.updatedAt).toLocaleDateString()}</span><button onClick={() => {setEditing(note.id);setTitle(note.title);setContent(note.content);}}>Edit</button></div></article>)}</div> : <div className="product-empty"><span className="empty-mark"><AppIcon icon={Layers01Icon} size={21}/></span><strong>{query ? 'No matching memories' : 'Your memory is ready'}</strong><p>{query ? 'Try a different search.' : 'Save details, preferences, and context you want to keep close.'}</p>{!query && <button className="product-secondary" onClick={startNew}><AppIcon icon={Add01Icon} size={14}/> Create your first memory</button>}</div>}
-    <div className="page-footnote">Local notes are not yet connected to the Memory Agent or synchronized to an account.</div>
+    <div className="local-data-banner"><span className="local-dot"/> Local browser records <span>·</span> Embedding vectors are generated by the server memory engine.</div>
+    <div className="memory-limit-note">Memory text is limited to 350 characters. The server also applies a 128 estimated-token safety limit before embedding.</div>
+    {editing !== null && <section className="memory-editor"><div className="editor-heading"><strong>{editing === 'new' ? 'New memory' : 'Edit memory'}</strong><button aria-label="Close editor" onClick={() => setEditing(null)}><AppIcon icon={Cancel01Icon} size={16}/></button></div><div className="memory-editor-row"><input className="memory-content-input" value={content} onChange={(e) => setContent(e.target.value)} placeholder="Write one clear memory…" maxLength={350}/><select aria-label="Memory category" value={category} onChange={(e) => setCategory(e.target.value as MemoryNote['category'])}><option value="preference">Preference</option><option value="fact">Fact</option><option value="task">Task</option></select></div><div className="editor-actions"><span className="memory-token-count">{Array.from(content).length} / 350 characters</span><button className="product-secondary" onClick={() => setEditing(null)}>Cancel</button><button className="product-primary" disabled={!content.trim()} onClick={save}><AppIcon icon={Tick02Icon} size={15}/> Save memory</button></div></section>}
+    {visible.length ? <div className="memory-list">{visible.map((note) => <article className="memory-row" key={note.id}><span className="memory-row-content" title={note.content}>{note.content}</span><span className={`memory-category-pill ${note.category}`}>{note.category}</span><time className="memory-row-time" title={new Date(note.updatedAt).toLocaleString()}>{new Date(note.updatedAt).toLocaleDateString()}</time><span className="memory-row-actions"><button title="Edit memory" aria-label="Edit memory" onClick={() => startEdit(note)}><AppIcon icon={Edit01Icon} size={14}/></button><button title="Delete memory" aria-label="Delete memory" onClick={() => remove(note)}><AppIcon icon={Delete02Icon} size={14}/></button></span></article>)}</div> : <div className="product-empty"><span className="empty-mark"><AppIcon icon={Layers01Icon} size={21}/></span><strong>{query ? 'No matching memories' : 'Your memory is ready'}</strong><p>{query ? 'Try a different search.' : 'Save a preference, fact, or task as one concise memory.'}</p>{!query && <button className="product-secondary" onClick={startNew}><AppIcon icon={Add01Icon} size={14}/> Create your first memory</button>}</div>}
+    <div className="page-footnote">Memory entries are stored locally in this browser. The UI is not yet connected to the server SQLite store.</div>
   </div>;
 }
 

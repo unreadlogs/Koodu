@@ -11,5 +11,6 @@ AGENTS.md
 MEMORY.md
 apps/web/public/companion/
 apps/server/public/companion/
+.data/
 temp/
 .gitignore
