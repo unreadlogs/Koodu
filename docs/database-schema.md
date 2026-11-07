@@ -6,7 +6,7 @@
 - Override: `KOODU_DATABASE_PATH`; relative overrides resolve from the repository root.
 - Driver: `better-sqlite3`; WAL mode, foreign keys, and a 5-second busy timeout are enabled.
 - Startup runs `CREATE TABLE/INDEX IF NOT EXISTS` in `apps/server/src/storage/database.ts`.
-- Tables are created, but most frontend pages still read/write localStorage or preview data. This document describes the current SQL fields and their intended values; it does not claim those UI paths are integrated.
+- Schema creation and feature wiring are listed separately below; some tables remain planned or unused.
 - SQLite `INTEGER` is used for booleans (`0` false, `1` true), timestamps, and counts. `TEXT` timestamps use ISO-8601 unless a table explicitly stores Unix milliseconds.
 
 ## Table-by-table columns
@@ -135,6 +135,27 @@ Index: `status`. Task execution/checkpoint payloads should go in events or a fut
 
 Promote a draft into `agent_tasks` only when actual execution is requested; preserve or delete the draft by explicit policy.
 
+### `chat_conversations` — saved conversation list
+
+| Column | SQLite type | Key / nullability | Meaning and example |
+|---|---|---|---|
+| `id` | `TEXT` | Primary key | UUID used to address a conversation over WebSocket. |
+| `title` | `TEXT` | Required | User-facing title; initially `New chat`, then derived from the first user message (maximum 56 characters). |
+| `created_at` | `TEXT` | Required | ISO timestamp when the conversation was created. |
+| `updated_at` | `TEXT` | Required | ISO timestamp of the latest message. |
+
+### `chat_messages` — durable user and assistant messages
+
+| Column | SQLite type | Key / nullability | Meaning and example |
+|---|---|---|---|
+| `id` | `TEXT` | Primary key | UUID for an individual message. |
+| `conversation_id` | `TEXT` | Required FK to `chat_conversations.id`, cascade delete | Parent conversation. |
+| `role` | `TEXT` | Required, check constrained | `user` or `assistant`. |
+| `content` | `TEXT` | Required | Message text. Provider credentials and internal tool results are not stored as chat messages. |
+| `created_at` | `TEXT` | Required | ISO timestamp when persisted. |
+
+Index: `(conversation_id, created_at)`. Conversation CRUD, history, and send use central WebSocket RPC; assistant replies are streamed as request-correlated events.
+
 ### `skills` — Skills page instructions
 
 | Column | SQLite type | Key / nullability | Meaning and example |
@@ -148,18 +169,9 @@ Promote a draft into `agent_tasks` only when actual execution is requested; pres
 | `source` | `TEXT` | Required | Origin label, e.g. `builtin`, `user`, or `import`. |
 | `updated_at` | `INTEGER` | Required | Unix milliseconds, matching current local skill records. |
 
-### `workspace_logs` — Logs page records
+### Server log file — `assets/database/koodu.log.jsonl`
 
-| Column | SQLite type | Key / nullability | Meaning and example |
-|---|---|---|---|
-| `id` | `TEXT` | Primary key | UUID log row id. |
-| `at` | `INTEGER` | Required | Unix milliseconds. |
-| `level` | `TEXT` | Required | Current UI values: `info`, `success`, `warning`; extend with validated `error` if server errors are persisted. |
-| `source` | `TEXT` | Required | Component/category such as `connection`, `workspace`, `models`, `command`. |
-| `message` | `TEXT` | Required | Short searchable summary. |
-| `detail` | `TEXT` | Nullable | Optional explanatory text. Do not store raw API keys, passwords, or full sensitive payloads. |
-
-Index: descending `at`. Existing browser log retention is capped at 250 rows; server retention needs an equivalent cleanup policy.
+Logs are not stored in SQLite or browser storage. The server appends meaningful operation events to this file, keeps a 5,000-record in-memory cache, watches the file for changes, and streams new records over the WebSocket only to clients subscribed with `logs.watch`. `logs.unwatch` stops the stream when the Logs page unmounts. Generic RPC/list requests, route changes, RPC IDs, payloads, and user content are not recorded. Records use human-readable sentences for durable actions such as creating, updating, or deleting a memory, skill, or model profile.
 
 ## Page-to-table map
 
@@ -168,10 +180,11 @@ Index: descending `at`. Existing browser log retention is capped at 250 rows; se
 | Home / companion | `app_settings`, `companion_profiles` | Selection is localStorage; sprite files/manifest remain assets. |
 | Usage | `usage_events`, `model_profiles` | Metrics are illustrative preview values. |
 | Models | `model_profiles`, `model_usage` | Profiles/keys/usage counters currently live in server process memory; DB tables are not wired in. |
-| Agents | `agent_drafts`, `agent_tasks`, `agent_task_events` | Drafts are localStorage; execution is not connected. |
+| Agents | `agent_tasks`, `agent_task_events` | Agent task execution and lifecycle events are server-side; visible result is transient page state. |
+| Chats | `chat_conversations`, `chat_messages`, `agent_tasks`, `agent_task_events` | Conversations/messages and execution events persist in server SQLite; token deltas stream over WebSocket. |
 | Memory | `memories` | UI records are localStorage; `MainAgent` uses its SQLite memory store. |
 | Skills | `skills` | Skills are localStorage. |
-| Logs | `workspace_logs` | Logs are localStorage. |
+| Logs | `assets/database/koodu.log.jsonl` | Server JSONL file with bounded in-memory cache and opt-in WebSocket stream; no SQL or browser persistence. |
 | Settings | `app_settings` | Preferences and character selection are localStorage. |
 | Workspace tabs/layout | `workspace_state` | Current app uses direct routes and has no persisted iframe tab model yet. |
 
@@ -182,4 +195,4 @@ Index: descending `at`. Existing browser log retention is capped at 250 rows; se
 3. Add DB `CHECK` constraints for all enums, ranges, and booleans in a migration. Validate JSON and route values in TypeScript before writes and reads.
 4. Persist model credentials only after encryption-at-rest, key rotation, and redacted reads are implemented. The current `api_key` column is a schema placeholder, not authorization to persist plaintext keys.
 5. Keep provider/model base URLs and logged user text subject to validation and retention policy. Do not store auth tokens or secrets in settings/logs.
-6. Bound growth for `usage_events`, `agent_task_events`, and `workspace_logs` with configurable retention/archival.
+6. Bound growth for `usage_events` and `agent_task_events` with configurable retention/archival. Server logs are independently capped at 5,000 JSONL records.

@@ -13,6 +13,7 @@ const modelOutputSchema = z.object({
   args: z.record(z.unknown()).default({}),
   confidence: z.number().min(0).max(1).default(0.5),
   reply: z.string().max(500).nullable().default(null),
+  tool_calls: z.array(z.object({ name: z.string().min(1).max(40), args: z.record(z.unknown()) })).max(4).default([]),
 });
 
 const chatCompletionSchema = z.object({
@@ -20,6 +21,10 @@ const chatCompletionSchema = z.object({
     .array(z.object({ message: z.object({ content: z.string() }) }))
     .min(1),
   usage: z.object({ total_tokens: z.number().int().nonnegative().optional() }).optional(),
+});
+const streamedChunkSchema = z.object({
+  choices: z.array(z.object({ delta: z.object({ content: z.string().optional() }).optional() })).default([]),
+  usage: z.object({ total_tokens: z.number().int().nonnegative().optional() }).nullable().optional(),
 });
 
 export interface OpenAiRuntimeOptions {
@@ -80,8 +85,9 @@ export function createOpenAiRuntime(options: OpenAiRuntimeOptions): InferenceRun
               temperature: 0,
               max_tokens: options.maxOutputTokens ?? 300,
               response_format: { type: 'json_object' },
+              ...(request.onTextDelta ? { stream: true } : {}),
               messages: [
-                { role: 'system', content: buildSystemPrompt(options.kind) },
+                { role: 'system', content: buildSystemPrompt(options.kind, request.context) },
                 { role: 'user', content: buildUserPrompt(request) },
               ],
             }),
@@ -94,6 +100,12 @@ export function createOpenAiRuntime(options: OpenAiRuntimeOptions): InferenceRun
             'http_error',
             `${options.id}_status_${response.status}`,
           );
+        }
+
+        if (request.onTextDelta) {
+          if (!response.body) throw new InferenceError('invalid_output', `${options.id}_missing_stream`);
+          const streamed = await readStreamingCompletion(response.body, request.onTextDelta);
+          return parseModelOutput(streamed.content, options, streamed.totalTokens);
         }
 
         const body: unknown = await response.json();
@@ -121,6 +133,73 @@ export function createOpenAiRuntime(options: OpenAiRuntimeOptions): InferenceRun
   };
 
   return runtime;
+}
+
+async function readStreamingCompletion(
+  body: ReadableStream<Uint8Array>,
+  onTextDelta: (delta: string) => void,
+): Promise<{ content: string; totalTokens?: number }> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let pending = '';
+  let content = '';
+  let emittedReply = '';
+  let totalTokens: number | undefined;
+  const consume = (line: string): void => {
+    if (!line.startsWith('data:')) return;
+    const data = line.slice(5).trim();
+    if (!data || data === '[DONE]') return;
+    let value: unknown;
+    try { value = JSON.parse(data); } catch { return; }
+    const parsed = streamedChunkSchema.safeParse(value);
+    if (!parsed.success) return;
+    const delta = parsed.data.choices[0]?.delta?.content ?? '';
+    if (delta) {
+      content += delta;
+      const currentReply = readPartialReply(content);
+      if (currentReply.startsWith(emittedReply) && currentReply.length > emittedReply.length) {
+        onTextDelta(currentReply.slice(emittedReply.length));
+        emittedReply = currentReply;
+      }
+    }
+    if (parsed.data.usage?.total_tokens !== undefined) totalTokens = parsed.data.usage.total_tokens;
+  };
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      pending += decoder.decode(value, { stream: true });
+      const lines = pending.split(/\r?\n/);
+      pending = lines.pop() ?? '';
+      for (const line of lines) consume(line);
+    }
+    pending += decoder.decode();
+    if (pending.trim()) consume(pending);
+  } finally {
+    reader.releaseLock();
+  }
+  return { content, ...(totalTokens === undefined ? {} : { totalTokens }) };
+}
+
+/** Decode the reply JSON string while the enclosing JSON object is still arriving. */
+function readPartialReply(content: string): string {
+  const match = /"reply"\s*:\s*"/.exec(content);
+  if (!match || match.index === undefined) return '';
+  const start = match.index + match[0].length;
+  let escaped = false;
+  let end = content.length;
+  for (let index = start; index < content.length; index += 1) {
+    const char = content[index];
+    if (escaped) escaped = false;
+    else if (char === '\\') escaped = true;
+    else if (char === '"') { end = index; break; }
+  }
+  let raw = content.slice(start, end);
+  while (raw.length) {
+    try { return JSON.parse(`"${raw}"`) as string; }
+    catch { raw = raw.slice(0, -1); }
+  }
+  return '';
 }
 
 /** Exported for tests: a model reply is untrusted text, not an action. */
@@ -157,6 +236,7 @@ export function parseModelOutput(
     confidence: parsed.data.confidence,
     proposal: action ? { action, args: parsed.data.args } : null,
     reply: parsed.data.reply,
+    ...(parsed.data.tool_calls.length ? { toolCalls: parsed.data.tool_calls } : {}),
     ...(totalTokens === undefined ? {} : { usage: { totalTokens } }),
   };
 }

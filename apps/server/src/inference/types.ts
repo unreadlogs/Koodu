@@ -3,6 +3,7 @@ import type { ActionName } from '@koodu/protocol';
 export interface InferenceRequest {
   text: string;
   context: unknown;
+  onTextDelta?: (delta: string) => void;
 }
 
 export interface InferenceProposal {
@@ -10,11 +11,17 @@ export interface InferenceProposal {
   args: unknown;
 }
 
+export interface InferenceToolCall {
+  name: string;
+  args: Record<string, unknown>;
+}
+
 export interface InferenceResponse {
   provider: string;
   confidence: number;
   proposal: InferenceProposal | null;
   reply: string | null;
+  toolCalls?: InferenceToolCall[];
   usage?: { totalTokens?: number };
 }
 

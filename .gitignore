@@ -6,6 +6,7 @@ coverage/
 .env
 .env.local
 *.log
+*.log.jsonl
 .DS_Store
 AGENTS.md
 MEMORY.md
@@ -24,3 +25,4 @@ apps/server/public/companion/
 *.journal
 temp/
 .gitignore
+workspace/

@@ -22,7 +22,7 @@ interface MemoryRow {
   id: number;
   content: string;
   category: string;
-  embedding: Buffer;
+  embedding: Buffer | null;
 }
 
 /**
@@ -34,9 +34,12 @@ export class VectorMemoryStore {
   private readonly embeddings: TextEmbeddingProvider;
   private closed = false;
 
-  constructor(dbPath: string, embeddings: TextEmbeddingProvider) {
-    if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
-    this.db = new Database(dbPath);
+  private readonly ownsDatabase: boolean;
+
+  constructor(database: string | Database.Database, embeddings: TextEmbeddingProvider) {
+    this.ownsDatabase = typeof database === 'string';
+    if (typeof database === 'string' && database !== ':memory:') mkdirSync(dirname(database), { recursive: true });
+    this.db = typeof database === 'string' ? new Database(database) : database;
     this.embeddings = embeddings;
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('busy_timeout = 5000');
@@ -69,6 +72,28 @@ export class VectorMemoryStore {
     return Number(result.lastInsertRowid);
   }
 
+  async list(): Promise<Array<{ id: number; content: string; category: string; createdAt: number }>> {
+    this.assertOpen();
+    return this.db.prepare(`SELECT id, content, category, created_at AS createdAt FROM memories ORDER BY created_at DESC, id DESC`).all()
+      .map((row) => {
+        const item = row as { id: number; content: string; category: string; createdAt: string };
+        return { ...item, createdAt: Date.parse(`${item.createdAt.replace(' ', 'T')}Z`) || Date.now() };
+      });
+  }
+
+  async update(id: number, content: string, category: string): Promise<void> {
+    this.assertOpen();
+    if (!Number.isSafeInteger(id) || id <= 0) throw new Error('Memory id must be a positive integer.');
+    const cleanContent = sanitizeEmbeddingText(content);
+    const cleanCategory = sanitizeCategory(category);
+    if (!cleanContent) throw new Error('Memory content cannot be empty.');
+    if (!cleanCategory) throw new Error('Memory category cannot be empty.');
+    const embedding = await this.embeddings.embedText(cleanContent);
+    const result = this.db.prepare('UPDATE memories SET content = ?, category = ?, embedding = ?, last_accessed = CURRENT_TIMESTAMP WHERE id = ?')
+      .run(cleanContent, cleanCategory, float32ToBuffer(embedding), id);
+    if (result.changes === 0) throw new Error('Memory not found.');
+  }
+
   async search(
     query: string,
     options: MemorySearchOptions = {},
@@ -89,6 +114,7 @@ export class VectorMemoryStore {
       : (this.db.prepare('SELECT id, content, category, embedding FROM memories').all() as MemoryRow[]);
 
     const matches = rows
+      .filter((row): row is MemoryRow & { embedding: Buffer } => row.embedding !== null)
       .map((row) => ({
         id: row.id,
         content: row.content,
@@ -117,7 +143,7 @@ export class VectorMemoryStore {
 
   close(): void {
     if (this.closed) return;
-    this.db.close();
+    if (this.ownsDatabase) this.db.close();
     this.closed = true;
   }
 

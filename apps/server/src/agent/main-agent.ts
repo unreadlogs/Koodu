@@ -1,4 +1,5 @@
 import type { Needle as NeedleModel } from 'cactus-needle';
+import Database from 'better-sqlite3';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { VectorMemoryStore } from '../memory/vector-memory-store';
@@ -7,7 +8,8 @@ import { EmbeddingEngine, sanitizeEmbeddingText } from '../inference/embedding';
 export type MemoryCategory = 'preference' | 'fact' | 'task';
 
 export interface MainAgentOptions {
-  dbPath: string;
+  dbPath?: string;
+  database?: Database.Database;
   /** Pass a shared instance when the server already owns a Needle lifecycle. */
   needle?: NeedleModel;
   /** Pass a shared engine when other server features also need embeddings. */
@@ -25,7 +27,8 @@ export class MainAgent {
   constructor(options: MainAgentOptions) {
     this.ownsEmbeddings = options.embeddingEngine === undefined;
     this.embeddings = options.embeddingEngine ?? new EmbeddingEngine(options.needle);
-    this.memory = new VectorMemoryStore(options.dbPath, this.embeddings);
+    if (!options.database && !options.dbPath) throw new Error('MainAgent requires a database or dbPath.');
+    this.memory = new VectorMemoryStore(options.database ?? options.dbPath!, this.embeddings);
     this.logger = options.logger ?? console;
   }
 

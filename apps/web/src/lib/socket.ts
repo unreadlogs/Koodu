@@ -1,8 +1,9 @@
-import { rpcHelloSchema, rpcPongSchema, rpcResponseSchema, type RpcMethod } from '@koodu/protocol';
+import { rpcEventSchema, rpcHelloSchema, rpcPongSchema, rpcResponseSchema, type RpcLogEntry, type RpcMethod } from '@koodu/protocol';
 
 export type SocketState = 'connecting' | 'online' | 'offline';
 type Listener = () => void;
-type PendingRequest = { resolve: (value: any) => void; reject: (error: Error) => void; timer: number; method?: RpcMethod };
+type AgentStreamPayload = { kind: 'delta'; text: string } | { kind: 'reset' };
+type PendingRequest = { resolve: (value: any) => void; reject: (error: Error) => void; timer: number; method?: RpcMethod; onStream?: (event: AgentStreamPayload) => void };
 
 /** One multiplexed JSON WebSocket for all application data requests. */
 class KooduSocket {
@@ -15,16 +16,18 @@ class KooduSocket {
   private ready = false;
   private readyWaiters: Array<() => void> = [];
   private listeners = new Set<Listener>();
+  private logListeners = new Set<(entry: RpcLogEntry) => void>();
   private pending = new Map<string, PendingRequest>();
   private pings = new Map<string, number>();
   private pingValue: number | null = null;
 
   get snapshot() { return { state: this.state, ping: this.pingValue, authRequired: this.authRequired }; }
   subscribe(listener: Listener) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
+  subscribeLogEntries(listener: (entry: RpcLogEntry) => void) { this.logListeners.add(listener); return () => this.logListeners.delete(listener); }
   connect() { this.stopped = false; if (!this.socket || this.socket.readyState === WebSocket.CLOSED) this.open(); }
   disconnect() { this.stopped = true; if (this.reconnectTimer !== undefined) window.clearTimeout(this.reconnectTimer); this.socket?.close(); }
 
-  async request<T = any>(method: RpcMethod, payload: Record<string, unknown> = {}): Promise<T> {
+  async request<T = any>(method: RpcMethod, payload: Record<string, unknown> = {}, options: { onStream?: (event: AgentStreamPayload) => void } = {}): Promise<T> {
     this.connect();
     await this.whenReady();
     if (this.pending.size >= 128) throw new Error('Too many pending WebSocket requests.');
@@ -34,7 +37,7 @@ class KooduSocket {
         this.pending.delete(id);
         reject(new Error(`WebSocket request timed out: ${method}`));
       }, 30_000);
-      this.pending.set(id, { resolve, reject, timer, method });
+      this.pending.set(id, { resolve, reject, timer, method, onStream: options.onStream });
       try { this.socket?.send(JSON.stringify({ type: 'request', id, method, payload })); }
       catch { window.clearTimeout(timer); this.pending.delete(id); reject(new Error('WebSocket is not available.')); }
     });
@@ -90,6 +93,15 @@ class KooduSocket {
       if (sent !== undefined) { this.pingValue = Math.max(0, Math.round(performance.now() - sent)); this.pings.delete(pong.data.id); this.emit(); }
       return;
     }
+    const event = rpcEventSchema.safeParse(value);
+    if (event.success) {
+      if (event.data.event === 'logs.entry') {
+        for (const listener of this.logListeners) listener(event.data.payload);
+      } else {
+        this.pending.get(event.data.requestId)?.onStream?.(event.data.payload);
+      }
+      return;
+    }
     const response = rpcResponseSchema.safeParse(value);
     if (!response.success) return;
     const pending = this.pending.get(response.data.id);
@@ -101,8 +113,8 @@ class KooduSocket {
       if (pending.method === 'auth.logout') this.token = null;
       pending.resolve(result);
     } else {
-      if (response.data.error.code === 'unauthorized') this.token = null;
-      pending.reject(Object.assign(new Error(response.data.error.message ?? response.data.error.code), { code: response.data.error.code, details: response.data.error.details }));
+      if (response.data.error_code === 'unauthorized') this.token = null;
+      pending.reject(Object.assign(new Error(response.data.error), { code: response.data.error_code, details: response.data.details }));
     }
   }
 }

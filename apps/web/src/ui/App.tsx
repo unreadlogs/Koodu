@@ -7,9 +7,10 @@ import {
   Activity01Icon, ArrowUpRight01Icon, ChartLineData01Icon, Coins01Icon, Download01Icon,
   FileSearchIcon, FilterIcon, Refresh01Icon, Delete01Icon,
   PuzzleIcon, BookOpen01Icon, Upload01Icon,
+  Message01Icon,
 } from '@hugeicons/core-free-icons';
 import { AGENT_DESCRIPTORS, AGENT_TYPES, type AgentType } from '@koodu/protocol';
-import type { WorkspaceRoute } from '@koodu/protocol';
+import type { RpcLogEntry, WorkspaceRoute } from '@koodu/protocol';
 import { kooduSocket, type SocketState } from '../lib/socket';
 import { usePetController } from '../pet/pet-controller';
 
@@ -19,10 +20,6 @@ const fallbackIdleAnimation: Animation = { file: 'idle.png', frameCount: 6, fram
 type StartupPage = '/' | WorkspaceRoute;
 type AppPreferences = { animateCompanion: boolean; showCommandHint: boolean; startupPage: StartupPage };
 const PREFERENCES_KEY = 'koodu:settings:v1';
-const MEMORY_KEY = 'koodu:memory:v1';
-const AGENT_DRAFTS_KEY = 'koodu:agent-drafts:v1';
-const LOGS_KEY = 'koodu:logs:v1';
-const SKILLS_KEY = 'koodu:skills:v1';
 const defaultPreferences: AppPreferences = { animateCompanion: true, showCommandHint: true, startupPage: '/' };
 const homeCopy: Record<PetActivity, { lead: string; accent: string; detail: string }> = {
   idle: { lead: 'What are we', accent: 'working on?', detail: 'Open a page or enter a command.' },
@@ -37,6 +34,7 @@ const homeCopy: Record<PetActivity, { lead: string; accent: string; detail: stri
 };
 type RoutePage = { route: WorkspaceRoute; label: string; icon: IconSvgElement; subtitle: string };
 const pages: RoutePage[] = [
+  { route: '/workspace/chats', label: 'Chats', icon: Message01Icon, subtitle: 'Continue a conversation with your companion.' },
   { route: '/workspace/usage', label: 'Usage', icon: DashboardSpeed01Icon, subtitle: 'A clear view of your activity and resource use.' },
   { route: '/workspace/models', label: 'Models', icon: CpuIcon, subtitle: 'Manage the intelligence behind your companion.' },
   { route: '/workspace/agents', label: 'Agents', icon: AiSecurity02Icon, subtitle: 'Meet the agents working alongside Koodu.' },
@@ -46,14 +44,7 @@ const pages: RoutePage[] = [
   { route: '/workspace/settings', label: 'Settings', icon: Settings01Icon, subtitle: 'Manage your companion and workspace preferences.' },
 ];
 
-type LogEntry = { id: string; at: number; level: 'info' | 'success' | 'warning'; source: string; message: string; detail?: string };
-function appendLog(source: string, message: string, detail?: string, level: LogEntry['level'] = 'info') {
-  try {
-    const previous = readLocalList<LogEntry>(LOGS_KEY);
-    localStorage.setItem(LOGS_KEY, JSON.stringify([{id:crypto.randomUUID(),at:Date.now(),level,source,message,detail},...previous].slice(0,250)));
-    window.dispatchEvent(new CustomEvent('koodu:logs-updated'));
-  } catch { /* Log storage is optional and must not interrupt app actions. */ }
-}
+type LogEntry = RpcLogEntry;
 
 function readPreferences(): AppPreferences {
   try {
@@ -92,15 +83,8 @@ function useRoute() {
 function useRealtime() {
   const [snapshot, setSnapshot] = useState(kooduSocket.snapshot);
   useEffect(() => {
-    let previous: SocketState | null = null;
     const update = () => {
-      const next = kooduSocket.snapshot;
-      setSnapshot(next);
-      if (next.state !== previous) {
-        if (next.state === 'online') appendLog('connection', 'WebSocket connected', 'Central application data connection established.', 'success');
-        if (next.state === 'offline') appendLog('connection', 'WebSocket disconnected', 'The client will retry automatically.', 'warning');
-        previous = next.state;
-      }
+      setSnapshot(kooduSocket.snapshot);
     };
     kooduSocket.connect();
     const unsubscribe = kooduSocket.subscribe(update);
@@ -127,15 +111,6 @@ function App() {
   const [animations, setAnimations] = useState<Record<string, Animation>>({});
   const [command, setCommand] = useState('');
   const [feedback, setFeedback] = useState('');
-  const lastPath = useRef(path);
-
-  useEffect(() => {
-    if (lastPath.current !== path) {
-      appendLog('workspace', 'Route changed', path);
-      lastPath.current = path;
-    }
-  }, [path]);
-
   useEffect(() => {
     let cancelled = false;
     kooduSocket.request<{ animations?: Record<string, Animation> } & Record<string, Animation>>('companion.manifest', { character })
@@ -150,24 +125,29 @@ function App() {
   useEffect(() => { localStorage.setItem(PREFERENCES_KEY, JSON.stringify(preferences)); }, [preferences]);
   const updatePreferences = (changes: Partial<AppPreferences>) => setPreferences((current) => ({ ...current, ...changes }));
 
-  const submit = () => {
+  const submit = async () => {
     const text = command.trim();
     if (!text) return;
-    appendLog('command', 'Command received', text);
     setCommand('');
     dispatchPetAction('think');
-    const requested = pages.find((page) => text.toLowerCase().includes(page.label.toLowerCase()));
-    window.setTimeout(() => {
-      if (requested) {
-        navigate(requested.route);
-        setFeedback(`Opening ${requested.label}`);
-        dispatchPetAction('celebrate');
-      } else {
-        setFeedback('Try a page name: Usage, Models, Agents, Memory, Logs, Skills, or Settings.');
-        dispatchPetAction('speak');
+    setFeedback('');
+    try {
+      const result = await kooduSocket.request<{ reply: string; proposal: { action: string; args: unknown } | null }>(
+        'agent.run', { role: 'cloud', text, context: { currentPath: path } },
+        { onStream: (event) => setFeedback((current) => event.kind === 'reset' ? '' : current + event.text) },
+      );
+      if (result.proposal?.action === 'open_tab' && result.proposal.args && typeof result.proposal.args === 'object') {
+        const route = (result.proposal.args as { route?: unknown }).route;
+        const requested = pages.find((page) => page.route === route);
+        if (requested) navigate(requested.route);
       }
-      window.setTimeout(() => { dispatchPetAction('reset'); setFeedback(''); }, 2200);
-    }, 350);
+      setFeedback(result.reply);
+      dispatchPetAction(result.proposal ? 'celebrate' : 'speak');
+    } catch (error) {
+      setFeedback(error instanceof Error ? error.message : 'The companion could not complete that request.');
+      dispatchPetAction('speak');
+    }
+    window.setTimeout(() => { dispatchPetAction('reset'); setFeedback(''); }, 5000);
   };
 
   return <main className="app-shell rail-collapsed">
@@ -214,11 +194,11 @@ function HomePage({ activity, character, animations, animateCompanion }: { activ
 function PetCharacter({ activity, character, animations, animate }: { activity: PetActivity; character: 'kumo' | 'kitsu'; animations: Record<string, Animation>; animate: boolean }) {
   const animation = animations[activity] ?? animations.idle ?? fallbackIdleAnimation;
   return <div className="pet-character" title={`${character === 'kumo' ? 'Kumo' : 'Kitsu'} · ${activity}`}>
-    <SpriteSheet key={`${character}-${activity}-${animation.file}`} character={character} animation={animation} animate={animate}/>
+    <SpriteSheet key={`${character}-${activity}-${animation.file}`} character={character} animation={animation} size="clamp(112px, min(42vw, 29vh), 210px)" animate={animate}/>
   </div>;
 }
 
-function SpriteSheet({ character, animation, size = 250, animate = true, loop }: { character: 'kumo' | 'kitsu'; animation: Animation; size?: number; animate?: boolean; loop?: boolean }) {
+function SpriteSheet({ character, animation, size = 250, animate = true, loop }: { character: 'kumo' | 'kitsu'; animation: Animation; size?: number | string; animate?: boolean; loop?: boolean }) {
   const [frame, setFrame] = useState(0);
   useEffect(() => {
     setFrame(0);
@@ -229,7 +209,8 @@ function SpriteSheet({ character, animation, size = 250, animate = true, loop }:
     return () => window.clearInterval(interval);
   }, [animation, animate, loop]);
   const framePercent = animation.frameCount > 1 ? frame / (animation.frameCount - 1) * 100 : 0;
-  return <span className="sprite-sheet" role="img" aria-label={`${character} companion animation`} style={{ width: size, height: size * animation.frameHeight / animation.frameWidth, backgroundImage: `url(/companion/${character}/${animation.file})`, backgroundPosition: `${framePercent}% 0`, backgroundSize: `${animation.frameCount * 100}% 100%` }}/>;
+  const dynamicSize = typeof size === 'string';
+  return <span className="sprite-sheet" role="img" aria-label={`${character} companion animation`} style={{ width: dynamicSize ? size : `${size}px`, height: dynamicSize ? 'auto' : `${size * animation.frameHeight / animation.frameWidth}px`, aspectRatio: `${animation.frameWidth} / ${animation.frameHeight}`, backgroundImage: `url(/companion/${character}/${animation.file})`, backgroundPosition: `${framePercent}% 0`, backgroundSize: `${animation.frameCount * 100}% 100%` }}/>;
 }
 
 function ModulePage({ page, character, setCharacter, preferences, updatePreferences, connection }: { page: RoutePage; character: 'kumo' | 'kitsu'; setCharacter: (value: 'kumo' | 'kitsu') => void; preferences: AppPreferences; updatePreferences: (changes: Partial<AppPreferences>) => void; connection: { status: 'connecting' | 'online' | 'offline'; ping: number | null } }) {
@@ -241,6 +222,7 @@ function ModulePage({ page, character, setCharacter, preferences, updatePreferen
     {page.label === 'Settings' ? <SettingsPage character={character} setCharacter={setCharacter} preferences={preferences} updatePreferences={updatePreferences} connection={connection}/>
     : page.label === 'Memory' ? <MemoryPage/>
     : page.label === 'Agents' ? <AgentsPage/>
+    : page.label === 'Chats' ? <ChatsPage/>
     : page.label === 'Usage' ? <UsagePage/>
     : page.label === 'Logs' ? <LogsPage/>
     : page.label === 'Skills' ? <SkillsPage/>
@@ -294,78 +276,115 @@ function UsageMetric({icon,label,value,delta,detail}:{icon:IconSvgElement;label:
 }
 
 function LogsPage() {
-  const [entries, setEntries] = useState<LogEntry[]>(() => readLocalList<LogEntry>(LOGS_KEY));
+  const [entries, setEntries] = useState<LogEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [clearing, setClearing] = useState(false);
   const [query, setQuery] = useState('');
   const [source, setSource] = useState('all');
   const [expanded, setExpanded] = useState<string | null>(null);
-  const refresh = () => setEntries(readLocalList<LogEntry>(LOGS_KEY));
+  const receive = (entry: LogEntry) => {
+    setEntries((current) => [...new Map([...current, entry].map((item) => [item.id, item])).values()].sort((a,b) => b.at-a.at).slice(0,500));
+  };
+  const requestSnapshot = async () => {
+    setError(''); setLoading(true);
+    try {
+      const result = await kooduSocket.request<{entries:LogEntry[]}>('logs.watch');
+      setEntries(result.entries.sort((a,b) => b.at-a.at).slice(0,500));
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not load server logs.'); }
+    finally { setLoading(false); }
+  };
   useEffect(() => {
-    window.addEventListener('koodu:logs-updated', refresh);
-    const poll = window.setInterval(refresh, 1500);
-    return () => { window.removeEventListener('koodu:logs-updated', refresh); window.clearInterval(poll); };
+    let active = true;
+    let watching = false;
+    const unlistenEntries = kooduSocket.subscribeLogEntries(receive);
+    const startWatching = () => {
+      if (!active || watching || kooduSocket.snapshot.state !== 'online') return;
+      watching = true;
+      void requestSnapshot().catch(() => { watching = false; });
+    };
+    const unlistenSocket = kooduSocket.subscribe(() => {
+      if (kooduSocket.snapshot.state === 'online') startWatching();
+      else watching = false;
+    });
+    startWatching();
+    return () => {
+      active = false;
+      unlistenEntries(); unlistenSocket();
+      if (watching && kooduSocket.snapshot.state === 'online') void kooduSocket.request('logs.unwatch').catch(() => {});
+    };
   }, []);
   const sources = [...new Set(entries.map((entry) => entry.source))];
   const filtered = entries.filter((entry) => (source === 'all' || entry.source === source) && `${entry.message} ${entry.detail ?? ''} ${entry.source}`.toLowerCase().includes(query.toLowerCase()));
   const exportLogs = () => {
     const blob = new Blob([JSON.stringify(filtered, null, 2)], {type:'application/json'}); const url=URL.createObjectURL(blob); const anchor=document.createElement('a'); anchor.href=url; anchor.download='koodu-workspace-logs.json'; anchor.click(); URL.revokeObjectURL(url);
   };
-  const clearLogs = () => { localStorage.removeItem(LOGS_KEY); setEntries([]); setExpanded(null); };
+  const clearLogs = async () => {
+    setClearing(true); setError('');
+    try { await kooduSocket.request('logs.clear'); setEntries([]); setExpanded(null); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not clear server logs.'); }
+    finally { setClearing(false); }
+  };
   return <div className="product-page logs-page">
-    <div className="logs-summary"><div className="logs-summary-icon"><AppIcon icon={Activity01Icon} size={18}/></div><div><strong>Workspace event log</strong><small>Client-side navigation, commands, and WebSocket connection events.</small></div><span className="logs-live"><i/> CAPTURING</span></div>
-    <div className="logs-toolbar"><label className="product-search"><AppIcon icon={Search01Icon} size={16}/><input value={query} onChange={(e)=>setQuery(e.target.value)} placeholder="Search events, details, or source"/></label><label className="logs-filter"><AppIcon icon={FilterIcon} size={14}/><select aria-label="Filter event source" value={source} onChange={(e)=>setSource(e.target.value)}><option value="all">All sources</option>{sources.map(item=><option key={item} value={item}>{item}</option>)}</select></label><button className="product-secondary logs-export" onClick={exportLogs} disabled={!filtered.length}><AppIcon icon={Download01Icon} size={14}/> Export</button><button className="product-secondary logs-clear" onClick={clearLogs} disabled={!entries.length}><AppIcon icon={Delete01Icon} size={14}/> Clear</button></div>
-    <div className="logs-table-wrap"><div className="logs-table-head"><span>EVENT</span><span>SOURCE</span><span>TIME</span><span>LEVEL</span></div>{filtered.length ? filtered.map((entry)=><article className={`log-entry ${expanded===entry.id?'expanded':''}`} key={entry.id}><button className="log-entry-main" onClick={()=>setExpanded(expanded===entry.id?null:entry.id)} aria-expanded={expanded===entry.id}><span className={`log-indicator ${entry.level}`}/><span className="log-event-copy"><strong>{entry.message}</strong><small>{entry.detail ?? 'No additional event details.'}</small></span><span className="log-source">{entry.source}</span><span className="log-time" title={new Date(entry.at).toLocaleString()}>{new Date(entry.at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}</span><span className={`log-level ${entry.level}`}>{entry.level}</span></button>{expanded===entry.id && <div className="log-entry-detail"><span>EVENT ID <b>{entry.id}</b></span><span>OCCURRED <b>{new Date(entry.at).toLocaleString()}</b></span><span>DETAIL <b>{entry.detail ?? '—'}</b></span></div>}</article>) : <div className="logs-empty"><AppIcon icon={FileSearchIcon} size={22}/><strong>{entries.length ? 'No matching events' : 'Waiting for workspace events'}</strong><span>{entries.length ? 'Change the search or source filter.' : 'Route changes, commands, and connection status changes will appear here.'}</span></div>}</div>
-    <div className="logs-footer"><span>{filtered.length} {filtered.length===1?'EVENT':'EVENTS'} SHOWN</span><span>LOCAL ONLY · MOST RECENT 250 EVENTS</span></div>
-    <div className="page-footnote">This page shows client events saved in this browser. Server, model-provider, and agent execution logs are not connected yet.</div>
+    <div className="logs-toolbar"><label className="product-search"><AppIcon icon={Search01Icon} size={16}/><input value={query} onChange={(e)=>setQuery(e.target.value)} placeholder="Search events, details, or source"/></label><LogSourceDropdown value={source} options={['all',...sources]} onChange={setSource}/><button className="product-secondary logs-export" onClick={exportLogs} disabled={!filtered.length}><AppIcon icon={Download01Icon} size={14}/> Export</button><button className="product-secondary" title="Refresh logs" aria-label="Refresh logs" onClick={()=>void requestSnapshot()} disabled={loading}><AppIcon icon={Refresh01Icon} size={14}/></button><button className="product-secondary logs-clear" onClick={()=>void clearLogs()} disabled={!entries.length||clearing}><AppIcon icon={Delete01Icon} size={14}/> Clear</button></div>
+    {error&&<div className="model-error"><AppIcon icon={Cancel01Icon} size={15}/>{error}<button onClick={()=>void requestSnapshot()}>Retry</button></div>}
+    <div className="logs-table-wrap"><div className="logs-table-head"><span>EVENT</span><span>SOURCE</span><span>TIME</span><span>LEVEL</span></div>{loading?<div className="logs-empty"><i className="tiny-spinner"/><strong>Loading server records</strong><span>Fetching the latest entries from the server.</span></div>:filtered.length ? filtered.map((entry)=><article className={`log-entry ${expanded===entry.id?'expanded':''}`} key={entry.id}><button className="log-entry-main" onClick={()=>setExpanded(expanded===entry.id?null:entry.id)} aria-expanded={expanded===entry.id}><span className={`log-indicator ${entry.level}`}/><span className="log-event-copy"><strong>{entry.message}</strong><small>{entry.detail ?? 'No additional details.'}</small></span><span className="log-source">{entry.source}</span><span className="log-time" title={new Date(entry.at).toLocaleString()}>{new Date(entry.at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}</span><span className={`log-level ${entry.level}`}>{entry.level}</span></button>{expanded===entry.id && <div className="log-entry-detail"><span>EVENT ID <b>{entry.id}</b></span><span>OCCURRED <b>{new Date(entry.at).toLocaleString()}</b></span><span>DETAIL <b>{entry.detail ?? '—'}</b></span></div>}</article>) : <div className="logs-empty"><AppIcon icon={FileSearchIcon} size={22}/><strong>{entries.length ? 'No matching events' : 'No server records yet'}</strong><span>{entries.length ? 'Change the search or source filter.' : 'Server requests and operations will appear here.'}</span></div>}</div>
+  </div>;
+}
+
+function LogSourceDropdown({value,options,onChange}:{value:string;options:string[];onChange:(value:string)=>void}){
+  const [open,setOpen]=useState(false);
+  const root=useRef<HTMLDivElement>(null);
+  useEffect(()=>{
+    if(!open)return;
+    const outside=(event:PointerEvent)=>{if(!root.current?.contains(event.target as Node))setOpen(false);};
+    const escape=(event:KeyboardEvent)=>{if(event.key==='Escape')setOpen(false);};
+    document.addEventListener('pointerdown',outside);document.addEventListener('keydown',escape);
+    return()=>{document.removeEventListener('pointerdown',outside);document.removeEventListener('keydown',escape);};
+  },[open]);
+  return <div className="logs-source-select" ref={root}>
+    <button type="button" className="logs-source-trigger" aria-haspopup="menu" aria-expanded={open} onClick={()=>setOpen(current=>!current)}><AppIcon icon={FilterIcon} size={14}/><span>{value==='all'?'All sources':value}</span><i/></button>
+    {open&&<div className="logs-source-menu" role="menu" aria-label="Filter log source">{options.map(option=><button type="button" role="menuitemradio" aria-checked={value===option} className={value===option?'selected':''} key={option} onClick={()=>{onChange(option);setOpen(false);}}>{option==='all'?'All sources':option}</button>)}</div>}
   </div>;
 }
 
 type SkillCategory = 'Research' | 'Development' | 'Organization' | 'Custom';
-type LocalSkill = { id: string; name: string; description: string; category: SkillCategory; instructions: string; enabled: boolean; source: string; updatedAt: number };
-const starterSkills: LocalSkill[] = [
-  {id:'starter-research-brief',name:'Research brief',description:'Turn a question into a concise, sourced research outline.',category:'Research',instructions:'Clarify the question and scope. Gather evidence from reliable sources. Separate verified facts from interpretation, cite sources, and finish with a short summary and open questions.',enabled:true,source:'Koodu starter',updatedAt:0},
-  {id:'starter-code-review',name:'Code review',description:'Review a change for correctness, risk, and maintainability.',category:'Development',instructions:'Inspect the changed code and its surrounding context. Prioritize concrete bugs and regressions, include file and line references, explain impact, and avoid speculative style feedback.',enabled:true,source:'Koodu starter',updatedAt:0},
-  {id:'starter-task-plan',name:'Task planner',description:'Break a larger request into clear, verifiable steps.',category:'Organization',instructions:'Restate the desired outcome, identify dependencies, split the work into small ordered steps, call out unresolved decisions, and define how completion can be verified.',enabled:true,source:'Koodu starter',updatedAt:0},
-];
+type SkillRecord = { id: string; name: string; description: string; category: SkillCategory; instructions: string; enabled: boolean; source: string; updatedAt: number };
 const skillCategories: SkillCategory[] = ['Research','Development','Organization','Custom'];
-function readSkills(): LocalSkill[] {
-  try {
-    const raw=localStorage.getItem(SKILLS_KEY);
-    if(raw===null){localStorage.setItem(SKILLS_KEY,JSON.stringify(starterSkills));return starterSkills;}
-    const parsed=JSON.parse(raw);
-    if(!Array.isArray(parsed)) return [];
-    return parsed.filter((item): item is LocalSkill => item && typeof item.id==='string' && typeof item.name==='string' && typeof item.description==='string' && typeof item.instructions==='string' && skillCategories.includes(item.category) && typeof item.enabled==='boolean' && typeof item.source==='string' && typeof item.updatedAt==='number');
-  } catch { return []; }
-}
+type SkillListResponse = { skills: SkillRecord[] };
+function normalizeSkills(value: unknown): SkillRecord[] { return Array.isArray(value) ? value.filter((item): item is SkillRecord => Boolean(item && typeof item==='object' && typeof (item as SkillRecord).id==='string' && typeof (item as SkillRecord).name==='string' && typeof (item as SkillRecord).description==='string' && typeof (item as SkillRecord).instructions==='string' && skillCategories.includes((item as SkillRecord).category) && typeof (item as SkillRecord).enabled==='boolean' && typeof (item as SkillRecord).source==='string' && typeof (item as SkillRecord).updatedAt==='number')) : []; }
 function SkillsPage() {
-  const [skills,setSkills]=useState<LocalSkill[]>(readSkills);
+  const [skills,setSkills]=useState<SkillRecord[]>([]);
+  const [loading,setLoading]=useState(true);
+  const [busy,setBusy]=useState(false);
+  const [error,setError]=useState('');
   const [query,setQuery]=useState('');
   const [category,setCategory]=useState<'All'|SkillCategory>('All');
   const [stateFilter,setStateFilter]=useState<'all'|'enabled'|'disabled'>('all');
-  const [editing,setEditing]=useState<LocalSkill|null>(null);
+  const [editing,setEditing]=useState<SkillRecord|null>(null);
   const [details,setDetails]=useState<string|null>(null);
   const [notice,setNotice]=useState('');
   const importRef=useRef<HTMLInputElement>(null);
-  const persist=(next:LocalSkill[])=>{setSkills(next);localStorage.setItem(SKILLS_KEY,JSON.stringify(next));};
+  const load=async()=>{setLoading(true);setError('');try{const body=await kooduSocket.request<SkillListResponse>('skills.list');setSkills(normalizeSkills(body.skills));}catch(reason){setError(reason instanceof Error?reason.message:'Could not load skills.');}finally{setLoading(false);}};
+  useEffect(()=>{void load();},[]);
   const beginCreate=()=>{setEditing({id:'new',name:'',description:'',category:'Custom',instructions:'',enabled:true,source:'Custom',updatedAt:Date.now()});setDetails(null);};
-  const saveSkill=(skill:LocalSkill)=>{const value={...skill,name:skill.name.trim(),description:skill.description.trim(),instructions:skill.instructions.trim(),updatedAt:Date.now()};if(!value.name||!value.description||!value.instructions)return;const next=skill.id==='new'?[value,...skills]:skills.map(item=>item.id===skill.id?value:item);persist(next);setEditing(null);setNotice(`“${value.name}” saved to your local skill library.`);appendLog('skills','Skill saved',value.name,'success');};
-  const toggle=(skill:LocalSkill)=>{persist(skills.map(item=>item.id===skill.id?{...item,enabled:!item.enabled,updatedAt:Date.now()}:item));appendLog('skills',skill.enabled?'Skill disabled':'Skill enabled',skill.name);};
-  const remove=(skill:LocalSkill)=>{persist(skills.filter(item=>item.id!==skill.id));setDetails(null);setNotice(`“${skill.name}” removed.`);appendLog('skills','Skill removed',skill.name,'warning');};
+  const saveSkill=async(skill:SkillRecord)=>{const value={...skill,id:skill.id==='new'?crypto.randomUUID():skill.id,name:skill.name.trim(),description:skill.description.trim(),instructions:skill.instructions.trim(),source:skill.source==='Koodu starter'?'Koodu starter':'Custom'};if(!value.name||!value.description||!value.instructions)return;setBusy(true);setError('');try{const result=await kooduSocket.request<SkillListResponse>('skills.save',value);setSkills(normalizeSkills(result.skills));setEditing(null);setNotice(`“${value.name}” saved.`);}catch(reason){setError(reason instanceof Error?reason.message:'Could not save skill.');}finally{setBusy(false);}};
+  const toggle=async(skill:SkillRecord)=>{setBusy(true);setError('');try{const result=await kooduSocket.request<SkillListResponse>('skills.save',{...skill,enabled:!skill.enabled});setSkills(normalizeSkills(result.skills));}catch(reason){setError(reason instanceof Error?reason.message:'Could not update skill.');}finally{setBusy(false);}};
+  const remove=async(skill:SkillRecord)=>{setBusy(true);setError('');try{const result=await kooduSocket.request<SkillListResponse>('skills.delete',{id:skill.id});setSkills(normalizeSkills(result.skills));setDetails(null);setNotice(`“${skill.name}” removed.`);}catch(reason){setError(reason instanceof Error?reason.message:'Could not delete skill.');}finally{setBusy(false);}};
   const visible=skills.filter(skill=>(category==='All'||skill.category===category)&&(stateFilter==='all'||(stateFilter==='enabled'?skill.enabled:!skill.enabled))&&`${skill.name} ${skill.description} ${skill.instructions}`.toLowerCase().includes(query.toLowerCase()));
   const exportSkills=()=>{const url=URL.createObjectURL(new Blob([JSON.stringify(skills,null,2)],{type:'application/json'}));const anchor=document.createElement('a');anchor.href=url;anchor.download='koodu-skills.json';anchor.click();URL.revokeObjectURL(url);};
-  const importSkills=async(file:File)=>{try{const parsed=JSON.parse(await file.text());const incoming=Array.isArray(parsed)?parsed:parsed.skills;if(!Array.isArray(incoming))throw new Error('Expected a skill array.');const valid=incoming.filter((item:any)=>item&&typeof item.name==='string'&&typeof item.description==='string'&&typeof item.instructions==='string');if(!valid.length)throw new Error('No valid skills found.');const additions:LocalSkill[]=valid.map((item:any)=>({id:crypto.randomUUID(),name:item.name.trim().slice(0,80),description:item.description.trim().slice(0,180),category:skillCategories.includes(item.category)?item.category:'Custom',instructions:item.instructions.trim(),enabled:typeof item.enabled==='boolean'?item.enabled:true,source:'Imported',updatedAt:Date.now()})).filter(item=>item.name&&item.description&&item.instructions);persist([...additions,...skills]);setNotice(`${additions.length} skill${additions.length===1?'':'s'} imported.`);appendLog('skills','Skills imported',`${additions.length} definitions`,'success');}catch(error){setNotice(error instanceof Error?`Import failed: ${error.message}`:'Import failed. Check the JSON file.');}finally{if(importRef.current)importRef.current.value='';}};
+  const importSkills=async(file:File)=>{try{const parsed=JSON.parse(await file.text());const incoming=Array.isArray(parsed)?parsed:parsed.skills;if(!Array.isArray(incoming))throw new Error('Expected a skill array.');const additions:SkillRecord[]=incoming.filter((item:any)=>item&&typeof item.name==='string'&&typeof item.description==='string'&&typeof item.instructions==='string').map((item:any)=>({id:crypto.randomUUID(),name:item.name.trim().slice(0,80),description:item.description.trim().slice(0,180),category:skillCategories.includes(item.category)?item.category:'Custom',instructions:item.instructions.trim().slice(0,12000),enabled:typeof item.enabled==='boolean'?item.enabled:true,source:'Imported',updatedAt:Date.now()})).filter(item=>item.name&&item.description&&item.instructions);if(!additions.length)throw new Error('No valid skills found.');setBusy(true);const result=await kooduSocket.request<SkillListResponse>('skills.import',{skills:additions});setSkills(normalizeSkills(result.skills));setNotice(`${additions.length} skill${additions.length===1?'':'s'} imported.`);}catch(reason){setError(reason instanceof Error?reason.message:'Import failed. Check the JSON file.');}finally{setBusy(false);if(importRef.current)importRef.current.value='';}};
   return <div className="product-page skills-page">
-    <div className="skills-summary"><span className="skills-summary-icon"><AppIcon icon={PuzzleIcon} size={19}/></span><div><strong>Your skill library</strong><small>Reusable playbooks with instructions and preferences for agent tasks.</small></div><span className="skills-count"><b>{skills.filter(skill=>skill.enabled).length}</b> ENABLED</span></div>
-    <div className="skills-toolbar"><label className="product-search"><AppIcon icon={Search01Icon} size={16}/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search your skills"/></label><button className="product-secondary" onClick={()=>importRef.current?.click()}><AppIcon icon={Upload01Icon} size={14}/> Import</button><input ref={importRef} type="file" accept="application/json,.json" hidden onChange={e=>{const file=e.target.files?.[0];if(file)void importSkills(file);}}/><button className="product-secondary" onClick={exportSkills}><AppIcon icon={Download01Icon} size={14}/> Export</button><button className="product-primary" onClick={beginCreate}><AppIcon icon={Add01Icon} size={15}/> New skill</button></div>
+    <div className="skills-toolbar"><label className="product-search"><AppIcon icon={Search01Icon} size={16}/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search your skills"/></label><button className="product-secondary" onClick={()=>importRef.current?.click()} disabled={busy}><AppIcon icon={Upload01Icon} size={14}/> Import</button><input ref={importRef} type="file" accept="application/json,.json" hidden onChange={e=>{const file=e.target.files?.[0];if(file)void importSkills(file);}}/><button className="product-secondary" onClick={exportSkills} disabled={loading||!skills.length}><AppIcon icon={Download01Icon} size={14}/> Export</button><button className="product-secondary" onClick={()=>void load()} disabled={loading||busy}><AppIcon icon={Refresh01Icon} size={14}/></button><button className="product-primary" onClick={beginCreate}><AppIcon icon={Add01Icon} size={15}/> New skill</button></div>
     <div className="skills-controls"><div className="skill-categories">{(['All',...skillCategories] as const).map(item=><button key={item} className={category===item?'active':''} onClick={()=>setCategory(item)}>{item}</button>)}</div><div className="skill-state-filter"><button className={stateFilter==='all'?'active':''} onClick={()=>setStateFilter('all')}>All {skills.length}</button><button className={stateFilter==='enabled'?'active':''} onClick={()=>setStateFilter('enabled')}>Enabled {skills.filter(skill=>skill.enabled).length}</button><button className={stateFilter==='disabled'?'active':''} onClick={()=>setStateFilter('disabled')}>Disabled {skills.filter(skill=>!skill.enabled).length}</button></div></div>
-    {notice&&<div className="skill-notice"><AppIcon icon={Tick02Icon} size={14}/>{notice}<button aria-label="Dismiss notice" onClick={()=>setNotice('')}><AppIcon icon={Cancel01Icon} size={13}/></button></div>}
+    {error&&<div className="model-error"><AppIcon icon={Cancel01Icon} size={15}/>{error}<button onClick={()=>void load()}>Retry</button></div>}{notice&&<div className="skill-notice"><AppIcon icon={Tick02Icon} size={14}/>{notice}<button aria-label="Dismiss notice" onClick={()=>setNotice('')}><AppIcon icon={Cancel01Icon} size={13}/></button></div>}
     {editing&&<SkillEditor key={editing.id} value={editing} onSave={saveSkill} onCancel={()=>setEditing(null)}/>}
-    {visible.length?<div className="skill-grid">{visible.map(skill=><article className={`skill-card ${!skill.enabled?'disabled':''} ${details===skill.id?'open':''}`} key={skill.id}><div className="skill-card-head"><span className="skill-card-icon"><AppIcon icon={skill.category==='Research'?Search01Icon:skill.category==='Development'?CpuIcon:skill.category==='Organization'?DashboardSpeed01Icon:BookOpen01Icon} size={18}/></span><span className="skill-source">{skill.source}</span><button className={`skill-switch ${skill.enabled?'on':''}`} role="switch" aria-checked={skill.enabled} aria-label={`${skill.enabled?'Disable':'Enable'} ${skill.name}`} onClick={()=>toggle(skill)}><i/></button></div><button className="skill-card-info" onClick={()=>setDetails(details===skill.id?null:skill.id)} aria-expanded={details===skill.id}><span className="skill-meta">{skill.category.toUpperCase()}</span><strong>{skill.name}</strong><small>{skill.description}</small></button>{details===skill.id&&<div className="skill-instructions"><span>INSTRUCTIONS</span><p>{skill.instructions}</p></div>}<div className="skill-card-footer"><span className={`skill-enabled-state ${skill.enabled?'enabled':''}`}><i/>{skill.enabled?'Enabled':'Disabled'}</span><div><button aria-label={`Edit ${skill.name}`} title="Edit" onClick={()=>{setEditing(skill);setDetails(null);}}><AppIcon icon={Edit01Icon} size={14}/></button><button aria-label={`Delete ${skill.name}`} title="Delete" onClick={()=>remove(skill)}><AppIcon icon={Delete02Icon} size={14}/></button></div></div></article>)}</div>:<div className="product-empty"><span className="empty-mark"><AppIcon icon={PuzzleIcon} size={21}/></span><strong>{skills.length?'No skills match these filters':'No skills yet'}</strong><p>Try a different filter or create a skill for your library.</p><button className="product-secondary" onClick={beginCreate}><AppIcon icon={Add01Icon} size={14}/> Create a skill</button></div>}
-    <div className="skills-runtime-note"><AppIcon icon={Activity01Icon} size={14}/><span><strong>Local skill library</strong> Skills can be managed here now. Agent task execution does not consume these instructions until the AgentEngine integration is connected.</span></div>
+    {loading?<div className="product-empty">Loading skills…</div>:visible.length?<div className="skill-grid">{visible.map(skill=><article className={`skill-card ${!skill.enabled?'disabled':''} ${details===skill.id?'open':''}`} key={skill.id}><div className="skill-card-head"><span className="skill-card-icon"><AppIcon icon={skill.category==='Research'?Search01Icon:skill.category==='Development'?CpuIcon:skill.category==='Organization'?DashboardSpeed01Icon:BookOpen01Icon} size={18}/></span><span className="skill-source">{skill.source}</span><button className={`skill-switch ${skill.enabled?'on':''}`} role="switch" aria-checked={skill.enabled} aria-label={`${skill.enabled?'Disable':'Enable'} ${skill.name}`} disabled={busy} onClick={()=>void toggle(skill)}><i/></button></div><button className="skill-card-info" onClick={()=>setDetails(details===skill.id?null:skill.id)} aria-expanded={details===skill.id}><span className="skill-meta">{skill.category.toUpperCase()}</span><strong>{skill.name}</strong><small>{skill.description}</small></button>{details===skill.id&&<div className="skill-instructions"><span>INSTRUCTIONS</span><p>{skill.instructions}</p></div>}<div className="skill-card-footer"><span className={`skill-enabled-state ${skill.enabled?'enabled':''}`}><i/>{skill.enabled?'Enabled':'Disabled'}</span><div><button aria-label={`Edit ${skill.name}`} title="Edit" disabled={busy} onClick={()=>{setEditing(skill);setDetails(null);}}><AppIcon icon={Edit01Icon} size={14}/></button><button aria-label={`Delete ${skill.name}`} title="Delete" disabled={busy} onClick={()=>void remove(skill)}><AppIcon icon={Delete02Icon} size={14}/></button></div></div></article>)}</div>:<div className="product-empty"><span className="empty-mark"><AppIcon icon={PuzzleIcon} size={21}/></span><strong>{skills.length?'No skills match these filters':'No skills yet'}</strong><p>Try a different filter or create a skill for your library.</p><button className="product-secondary" onClick={beginCreate}><AppIcon icon={Add01Icon} size={14}/> Create a skill</button></div>}
   </div>;
 }
-function SkillEditor({value,onSave,onCancel}:{value:LocalSkill;onSave:(skill:LocalSkill)=>void;onCancel:()=>void}) {
+function SkillEditor({value,onSave,onCancel}:{value:SkillRecord;onSave:(skill:SkillRecord)=>void|Promise<void>;onCancel:()=>void}) {
   const [draft,setDraft]=useState(value);
-  return <section className="skill-editor"><div className="skill-editor-heading"><div><strong>{value.id==='new'?'Create a skill':'Edit skill'}</strong><small>Write clear steps an agent can follow.</small></div><button aria-label="Close editor" onClick={onCancel}><AppIcon icon={Cancel01Icon} size={16}/></button></div><div className="skill-form-grid"><label>Skill name<input value={draft.name} maxLength={80} onChange={e=>setDraft({...draft,name:e.target.value})} placeholder="e.g. Release checklist"/></label><label>Category<select value={draft.category} onChange={e=>setDraft({...draft,category:e.target.value as SkillCategory})}>{skillCategories.map(category=><option key={category}>{category}</option>)}</select></label><label className="skill-description-field">Description<input value={draft.description} maxLength={180} onChange={e=>setDraft({...draft,description:e.target.value})} placeholder="What does this skill help with?"/></label><label className="skill-instructions-field">Instructions<textarea rows={5} value={draft.instructions} onChange={e=>setDraft({...draft,instructions:e.target.value})} placeholder="Write the steps, constraints, and expected output…"/></label></div><div className="skill-editor-actions"><button className="product-secondary" onClick={onCancel}>Cancel</button><button className="product-primary" disabled={!draft.name.trim()||!draft.description.trim()||!draft.instructions.trim()} onClick={()=>onSave(draft)}><AppIcon icon={Tick02Icon} size={14}/> Save skill</button></div></section>;
+  return <section className="skill-editor"><div className="skill-editor-heading"><div><strong>{value.id==='new'?'Create a skill':'Edit skill'}</strong><small>Write clear steps an agent can follow.</small></div><button aria-label="Close editor" onClick={onCancel}><AppIcon icon={Cancel01Icon} size={16}/></button></div><div className="skill-form-grid"><label>Skill name<input value={draft.name} maxLength={80} onChange={e=>setDraft({...draft,name:e.target.value})} placeholder="e.g. Release checklist"/></label><label>Category<select value={draft.category} onChange={e=>setDraft({...draft,category:e.target.value as SkillCategory})}>{skillCategories.map(category=><option key={category}>{category}</option>)}</select></label><label className="skill-description-field">Description<input value={draft.description} maxLength={180} onChange={e=>setDraft({...draft,description:e.target.value})} placeholder="What does this skill help with?"/></label><label className="skill-instructions-field">Instructions<textarea rows={5} maxLength={12000} value={draft.instructions} onChange={e=>setDraft({...draft,instructions:e.target.value})} placeholder="Write the steps, constraints, and expected output…"/></label></div><div className="skill-editor-actions"><button className="product-secondary" onClick={onCancel}>Cancel</button><button className="product-primary" disabled={!draft.name.trim()||!draft.description.trim()||!draft.instructions.trim()} onClick={()=>void onSave(draft)}><AppIcon icon={Tick02Icon} size={14}/> Save skill</button></div></section>;
 }
 
 type ModelProvider='openai'|'openrouter'|'google'|'custom';
@@ -382,20 +401,17 @@ function ModelsPage(){
   const [testStatus,setTestStatus]=useState<Record<string,string>>({});
   const load=()=>{setLoading(true);kooduSocket.request<{profiles:ModelProfile[]}>('models.list',{}).then(body=>{setProfiles(Array.isArray(body.profiles)?body.profiles:[]);setError('');}).catch(reason=>setError(reason instanceof Error?reason.message:'Could not load model profiles.')).finally(()=>setLoading(false));};
   useEffect(()=>{load();},[]);
-  const save=async(value:Omit<ModelProfile,'apiKeySet'>&{apiKey?:string;clearApiKey?:boolean})=>{await kooduSocket.request('models.save',value);setEditor(null);setNotice('Model profile saved securely on the server.');appendLog('models','Model profile saved',value.name,'success');load();};
-  const remove=async(profile:ModelProfile)=>{try{await kooduSocket.request('models.delete',{id:profile.id});setProfiles(items=>items.filter(item=>item.id!==profile.id));setNotice(`${profile.name} removed.`);appendLog('models','Model profile removed',profile.name,'warning');}catch(reason){setError(reason instanceof Error?reason.message:'Could not remove profile.');}};
+  const save=async(value:Omit<ModelProfile,'apiKeySet'>&{apiKey?:string;clearApiKey?:boolean})=>{await kooduSocket.request('models.save',value);setEditor(null);setNotice('Model profile saved securely on the server.');load();};
+  const remove=async(profile:ModelProfile)=>{try{await kooduSocket.request('models.delete',{id:profile.id});setProfiles(items=>items.filter(item=>item.id!==profile.id));setNotice(`${profile.name} removed.`);}catch(reason){setError(reason instanceof Error?reason.message:'Could not remove profile.');}};
   const activate=async(profile:ModelProfile)=>{try{await save({...profile,active:true,enabled:true});setNotice(`${profile.name} is now the active ${profile.role} profile.`);}catch(reason){setError(reason instanceof Error?reason.message:'Could not activate profile.');}};
   const test=async(profile:ModelProfile)=>{setTesting(profile.id);setTestStatus(current=>({...current,[profile.id]:''}));try{await kooduSocket.request('models.test',{id:profile.id});setTestStatus(current=>({...current,[profile.id]:'Connected'}));}catch(reason){const message=reason instanceof Error?reason.message:'Connection failed.';setTestStatus(current=>({...current,[profile.id]:message==='api_key_missing'?'Add an API key first.':message==='provider_unreachable'?'Provider endpoint could not be reached.':message}));}finally{setTesting(null);}};
   const create=()=>{setError('');setEditor({id:`model-${crypto.randomUUID().slice(0,8)}`,name:'',provider:'openai',model:'',baseUrl:providerUrls.openai,role:'cloud',maxOutputTokens:1024,monthlyTokenLimit:0,enabled:true,active:false,apiKeySet:false});};
   return <div className="product-page models-page">
-    <div className="models-summary"><span className="models-summary-icon"><AppIcon icon={CpuIcon} size={19}/></span><div><strong>Model providers</strong><small>Add multiple provider profiles and choose which one handles each inference route.</small></div><span className="models-summary-count">{profiles.length} PROFILE{profiles.length===1?'':'S'}</span></div>
     <div className="models-toolbar"><div className="models-runtime-status"><i className={error?'offline':'online'}/>{error?'SERVICE UNAVAILABLE':'SERVER-SIDE CONFIGURATION'}</div><button className="product-secondary" onClick={load}><AppIcon icon={Refresh01Icon} size={14}/> Refresh</button><button className="product-primary" onClick={create}><AppIcon icon={Add01Icon} size={15}/> Add model</button></div>
     {error&&<div className="model-error"><AppIcon icon={Cancel01Icon} size={15}/>{error}<button onClick={load}>Retry</button></div>}{notice&&<div className="skill-notice"><AppIcon icon={Tick02Icon} size={14}/>{notice}<button aria-label="Dismiss notice" onClick={()=>setNotice('')}><AppIcon icon={Cancel01Icon} size={13}/></button></div>}
-    <div className="model-route-grid">{(['cloud','local'] as const).map(role=>{const current=profiles.find(item=>item.role===role&&item.active&&item.enabled);return <div className="model-route-card" key={role}><span className="model-route-icon"><AppIcon icon={role==='cloud'?SparklesIcon:CpuIcon} size={16}/></span><span><small>{role==='cloud'?'CLOUD REASONING':'LOCAL INFERENCE'}</small><strong>{current?current.name:'Using server environment config'}</strong></span><span className={`route-state ${current?'configured':''}`}><i/>{current?'ACTIVE':'DEFAULT'}</span></div>;})}</div>
     {editor&&<ModelEditor key={editor.id} value={editor} onSave={save} onCancel={()=>setEditor(null)} onError={setError}/>}
     <div className="models-section-head"><div><strong>Configured models</strong><span>Provider keys remain on the server and are never sent back to the browser.</span></div><span>{profiles.length.toString().padStart(2,'0')}</span></div>
     {loading?<div className="model-loading"><i/>Loading provider profiles…</div>:profiles.length?<div className="model-profile-list">{profiles.map(profile=><article className={`model-profile ${!profile.enabled?'disabled':''}`} key={profile.id}><span className="model-provider-mark"><AppIcon icon={profile.provider==='google'?SparklesIcon:profile.provider==='custom'?Settings01Icon:CpuIcon} size={18}/></span><div className="model-profile-main"><div className="model-name-row"><strong>{profile.name}</strong><span className="provider-chip">{providerNames[profile.provider]}</span>{profile.active&&profile.enabled&&<span className="active-chip">ACTIVE</span>}</div><div className="model-identifiers"><span>{profile.model}</span><span>·</span><span>{profile.role==='cloud'?'Cloud':'Local'} route</span><span>·</span><span>{profile.apiKeySet?'Key configured':'No API key'}</span></div><div className="model-limits"><span>Output max <b>{profile.maxOutputTokens.toLocaleString()} tokens</b></span><span>Monthly cap <b>{profile.monthlyTokenLimit?`${profile.monthlyTokenLimit.toLocaleString()} tokens`:'Unlimited'}</b></span></div>{testStatus[profile.id]&&<div className={`model-test-result ${testStatus[profile.id]==='Connected'?'success':'failure'}`}>{testStatus[profile.id]}</div>}</div><div className="model-profile-actions"><button className="product-secondary" onClick={()=>void test(profile)} disabled={testing!==null}>{testing===profile.id?<i className="tiny-spinner"/>:<AppIcon icon={Activity01Icon} size={14}/>} Test</button>{!profile.active&&<button className="product-secondary activate-button" onClick={()=>void activate(profile)}>Use for {profile.role}</button>}<button className="icon-action" title="Edit profile" aria-label="Edit profile" onClick={()=>setEditor(profile)}><AppIcon icon={Edit01Icon} size={15}/></button><button className="icon-action danger" title="Delete profile" aria-label="Delete profile" onClick={()=>void remove(profile)}><AppIcon icon={Delete01Icon} size={15}/></button></div></article>)}</div>:!error?<div className="models-empty"><span className="empty-mark"><AppIcon icon={CpuIcon} size={21}/></span><strong>No model profiles added</strong><p>Add OpenAI, OpenRouter, Google AI Studio, or any OpenAI-compatible endpoint.</p><button className="product-primary" onClick={create}><AppIcon icon={Add01Icon} size={14}/> Add your first model</button></div>:null}
-    <div className="models-security-note"><AppIcon icon={ShieldCheckIcon} size={15}/><span><strong>Credential handling</strong> API keys are held in server memory only. They are not written to localStorage or returned by the server; restarting Koodu clears managed profiles and keys. Existing environment-based provider settings remain available as the fallback.</span></div>
   </div>;
 }
 function ModelEditor({value,onSave,onCancel,onError}:{value:ModelProfile;onSave:(model:Omit<ModelProfile,'apiKeySet'>&{apiKey?:string;clearApiKey?:boolean})=>Promise<void>;onCancel:()=>void;onError:(message:string)=>void}){
@@ -406,6 +422,10 @@ function ModelEditor({value,onSave,onCancel,onError}:{value:ModelProfile;onSave:
 }
 
 type MemoryNote = { id: string; content: string; category: 'preference' | 'fact' | 'task'; updatedAt: number };
+function readableMemoryError(reason: unknown, fallback: string): string {
+  const error = reason as { message?: unknown } | null;
+  return typeof error?.message === 'string' ? error.message : fallback;
+}
 function estimateMemoryTokens(text: string): number {
   const chunks = text.match(/[\p{L}\p{N}]+|[^\s]/gu) ?? [];
   return chunks.reduce((total, chunk) => total + (/[^\x00-\x7f]/u.test(chunk) ? Array.from(chunk).length : /^[\p{L}\p{N}]+$/u.test(chunk) ? Math.ceil(chunk.length / 4) : 1), 0);
@@ -426,54 +446,172 @@ function boundMemoryText(text: string): string {
   }
   return accepted.trim();
 }
-function readLocalList<T>(key: string): T[] {
-  try { const parsed = JSON.parse(localStorage.getItem(key) ?? '[]'); return Array.isArray(parsed) ? parsed as T[] : []; }
-  catch { return []; }
-}
 function MemoryPage() {
-  const [notes, setNotes] = useState<MemoryNote[]>(() => readLocalList<MemoryNote>(MEMORY_KEY).filter((note) => note && typeof note.id === 'string' && typeof note.content === 'string' && ['preference','fact','task'].includes(note.category) && typeof note.updatedAt === 'number'));
+  const [notes, setNotes] = useState<MemoryNote[]>([]);
   const [query, setQuery] = useState('');
   const [editing, setEditing] = useState<string | null>(null);
   const [content, setContent] = useState('');
   const [category, setCategory] = useState<MemoryNote['category']>('fact');
-  const persist = (next: MemoryNote[]) => { setNotes(next); localStorage.setItem(MEMORY_KEY, JSON.stringify(next)); };
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [errorToast, setErrorToast] = useState('');
+  useEffect(() => { if (!errorToast) return; const timeout = window.setTimeout(() => setErrorToast(''), 5000); return () => window.clearTimeout(timeout); }, [errorToast]);
+  const load = async () => {
+    setLoading(true); setError('');
+    try {
+      const result = await kooduSocket.request<{ memories: Array<{id:number;content:string;category:MemoryNote['category'];createdAt:number}> }>('memory.list');
+      setNotes(result.memories.map((item) => ({...item, id:String(item.id), updatedAt:item.createdAt})));
+    } catch (reason) { const message = readableMemoryError(reason, 'Could not load memories.'); setError(message); setErrorToast(message); }
+    finally { setLoading(false); }
+  };
+  useEffect(() => { void load(); }, []);
   const startNew = () => { setEditing('new'); setContent(''); setCategory('fact'); };
   const startEdit = (note: MemoryNote) => { setEditing(note.id); setContent(note.content); setCategory(note.category); };
-  const save = () => {
+  const save = async () => {
     const cleanContent = boundMemoryText(content);
     if (!cleanContent) return;
-    const note: MemoryNote = { id: editing === 'new' ? crypto.randomUUID() : editing!, content: cleanContent, category, updatedAt: Date.now() };
-    persist(editing === 'new' ? [note, ...notes] : notes.map((item) => item.id === editing ? note : item)); setEditing(null);
-    appendLog('memory', editing === 'new' ? 'Memory saved' : 'Memory updated', category, 'success');
+    setBusy(true); setError('');
+    try {
+      const result = await kooduSocket.request<{ memories: Array<{id:number;content:string;category:MemoryNote['category'];createdAt:number}> }>('memory.save', { ...(editing !== 'new' ? {id:Number(editing)} : {}), content:cleanContent, category });
+      setNotes(result.memories.map((item) => ({...item, id:String(item.id), updatedAt:item.createdAt}))); setEditing(null);
+    } catch (reason) { const message = readableMemoryError(reason, 'Could not save memory.'); setError(message); setErrorToast(message); }
+    finally { setBusy(false); }
   };
   const visible = notes.filter((note) => `${note.content} ${note.category}`.toLowerCase().includes(query.toLowerCase())).sort((a,b) => b.updatedAt-a.updatedAt);
-  const remove = (note: MemoryNote) => { persist(notes.filter((item) => item.id !== note.id)); appendLog('memory', 'Memory deleted', note.category, 'warning'); };
+  const remove = async (note: MemoryNote) => {
+    setBusy(true); setError('');
+    try { const result = await kooduSocket.request<{ memories: Array<{id:number;content:string;category:MemoryNote['category'];createdAt:number}> }>('memory.delete', {id:Number(note.id)}); setNotes(result.memories.map((item) => ({...item, id:String(item.id), updatedAt:item.createdAt}))); }
+    catch (reason) { const message = readableMemoryError(reason, 'Could not delete memory.'); setError(message); setErrorToast(message); }
+    finally { setBusy(false); }
+  };
   return <div className="product-page memory-page">
-    <div className="product-toolbar"><label className="product-search"><AppIcon icon={Search01Icon} size={16}/><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search saved memories"/></label><button className="product-primary" onClick={startNew}><AppIcon icon={Add01Icon} size={15}/> New memory</button></div>
-    <div className="local-data-banner"><span className="local-dot"/> Local browser records <span>·</span> Embedding vectors are generated by the server memory engine.</div>
-    <div className="memory-limit-note">Memory text is limited to 350 characters. The server also applies a 128 estimated-token safety limit before embedding.</div>
-    {editing !== null && <section className="memory-editor"><div className="editor-heading"><strong>{editing === 'new' ? 'New memory' : 'Edit memory'}</strong><button aria-label="Close editor" onClick={() => setEditing(null)}><AppIcon icon={Cancel01Icon} size={16}/></button></div><div className="memory-editor-row"><input className="memory-content-input" value={content} onChange={(e) => setContent(e.target.value)} placeholder="Write one clear memory…" maxLength={350}/><select aria-label="Memory category" value={category} onChange={(e) => setCategory(e.target.value as MemoryNote['category'])}><option value="preference">Preference</option><option value="fact">Fact</option><option value="task">Task</option></select></div><div className="editor-actions"><span className="memory-token-count">{Array.from(content).length} / 350 characters</span><button className="product-secondary" onClick={() => setEditing(null)}>Cancel</button><button className="product-primary" disabled={!content.trim()} onClick={save}><AppIcon icon={Tick02Icon} size={15}/> Save memory</button></div></section>}
-    {visible.length ? <div className="memory-list">{visible.map((note) => <article className="memory-row" key={note.id}><span className="memory-row-content" title={note.content}>{note.content}</span><span className={`memory-category-pill ${note.category}`}>{note.category}</span><time className="memory-row-time" title={new Date(note.updatedAt).toLocaleString()}>{new Date(note.updatedAt).toLocaleDateString()}</time><span className="memory-row-actions"><button title="Edit memory" aria-label="Edit memory" onClick={() => startEdit(note)}><AppIcon icon={Edit01Icon} size={14}/></button><button title="Delete memory" aria-label="Delete memory" onClick={() => remove(note)}><AppIcon icon={Delete02Icon} size={14}/></button></span></article>)}</div> : <div className="product-empty"><span className="empty-mark"><AppIcon icon={Layers01Icon} size={21}/></span><strong>{query ? 'No matching memories' : 'Your memory is ready'}</strong><p>{query ? 'Try a different search.' : 'Save a preference, fact, or task as one concise memory.'}</p>{!query && <button className="product-secondary" onClick={startNew}><AppIcon icon={Add01Icon} size={14}/> Create your first memory</button>}</div>}
-    <div className="page-footnote">Memory entries are stored locally in this browser. The UI is not yet connected to the server SQLite store.</div>
+    <div className="memory-toolbar"><label className="product-search"><AppIcon icon={Search01Icon} size={16}/><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search saved memories"/></label><div className="memory-toolbar-actions"><span className="memory-total">{notes.length} SAVED</span><button className="product-secondary memory-refresh" title="Refresh memories" aria-label="Refresh memories" onClick={() => void load()} disabled={loading}><AppIcon icon={Refresh01Icon} size={14}/></button><button className="product-primary" onClick={startNew}><AppIcon icon={Add01Icon} size={15}/> New memory</button></div></div>
+    {errorToast && <div className="memory-error-toast" role="alert"><span className="memory-error-mark">!</span><span>{errorToast}</span><button aria-label="Dismiss error" onClick={() => setErrorToast('')}><AppIcon icon={Cancel01Icon} size={14}/></button></div>}
+    {editing !== null && <section className="memory-editor"><div className="editor-heading"><strong>{editing === 'new' ? 'New memory' : 'Edit memory'}</strong><button aria-label="Close editor" disabled={busy} onClick={() => setEditing(null)}><AppIcon icon={Cancel01Icon} size={16}/></button></div><div className="memory-editor-row"><input className="memory-content-input" value={content} onChange={(e) => setContent(e.target.value)} placeholder="Write one clear memory…" maxLength={350} disabled={busy}/><select aria-label="Memory category" value={category} onChange={(e) => setCategory(e.target.value as MemoryNote['category'])} disabled={busy}><option value="preference">Preference</option><option value="fact">Fact</option><option value="task">Task</option></select></div><div className="editor-actions"><span className="memory-token-count">{Array.from(content).length} / 350 characters</span><button className="product-secondary" disabled={busy} onClick={() => setEditing(null)}>Cancel</button><button className="product-primary" disabled={busy||!content.trim()} onClick={() => void save()}>{busy?<i className="tiny-spinner"/>:<AppIcon icon={Tick02Icon} size={15}/>} {busy?'Saving…':'Save memory'}</button></div></section>}
+    {loading ? <div className="product-empty">Loading memories from server…</div> : visible.length ? <div className="memory-list">{visible.map((note) => <article className="memory-row" key={note.id}><span className="memory-row-content" title={note.content}>{note.content}</span><span className={`memory-category-pill ${note.category}`}>{note.category}</span><time className="memory-row-time" title={new Date(note.updatedAt).toLocaleString()}>{new Date(note.updatedAt).toLocaleDateString()}</time><span className="memory-row-actions"><button title="Edit memory" aria-label="Edit memory" disabled={busy} onClick={() => startEdit(note)}><AppIcon icon={Edit01Icon} size={14}/></button><button title="Delete memory" aria-label="Delete memory" disabled={busy} onClick={() => void remove(note)}><AppIcon icon={Delete02Icon} size={14}/></button></span></article>)}</div> : <div className="product-empty"><span className="empty-mark"><AppIcon icon={Layers01Icon} size={21}/></span><strong>{query ? 'No matching memories' : error ? 'Could not load memories' : 'Your memory is ready'}</strong><p>{query ? 'Try a different search.' : error ? 'Check the WebSocket connection and retry.' : 'Save a preference, fact, or task as one concise memory.'}</p>{!query && <button className="product-secondary" onClick={startNew}><AppIcon icon={Add01Icon} size={14}/> Create your first memory</button>}</div>}
   </div>;
 }
 
-type AgentDraft = { id: string; type: AgentType; task: string; createdAt: number };
+type ChatConversation = { id: string; title: string; createdAt: string; updatedAt: string; messageCount: number };
+type ChatMessage = { id: string; role: 'user' | 'assistant'; content: string; createdAt: string };
+function ChatsPage() {
+  const [conversations, setConversations] = useState<ChatConversation[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [draft, setDraft] = useState('');
+  const [role, setRole] = useState<'local' | 'cloud'>('cloud');
+  const [loading, setLoading] = useState(true);
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState('');
+  const messageListRef = useRef<HTMLDivElement>(null);
+  useEffect(() => { const element = messageListRef.current; if (element) element.scrollTop = element.scrollHeight; }, [messages]);
+
+  const loadConversations = async () => {
+    const result = await kooduSocket.request<{ conversations: ChatConversation[] }>('chats.list');
+    setConversations(result.conversations);
+  };
+  useEffect(() => {
+    let alive = true;
+    kooduSocket.request<{ conversations: ChatConversation[] }>('chats.list').then((result) => {
+      if (alive) setConversations(result.conversations);
+    }).catch((reason) => { if (alive) setError(reason instanceof Error ? reason.message : 'Could not load chats.'); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, []);
+  useEffect(() => {
+    if (!activeId) { setMessages([]); return; }
+    let alive = true;
+    setMessages([]); setError('');
+    kooduSocket.request<{ messages: ChatMessage[] }>('chats.messages', { conversationId: activeId })
+      .then((result) => { if (alive) setMessages(result.messages); })
+      .catch((reason) => { if (alive) setError(reason instanceof Error ? reason.message : 'Could not load this conversation.'); });
+    return () => { alive = false; };
+  }, [activeId]);
+
+  const createConversation = async () => {
+    setError('');
+    try {
+      const result = await kooduSocket.request<{ conversation: ChatConversation }>('chats.create', {});
+      setConversations((items) => [result.conversation, ...items]);
+      setActiveId(result.conversation.id);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not create a chat.'); }
+  };
+  const deleteConversation = async (conversationId: string) => {
+    setError('');
+    try {
+      await kooduSocket.request('chats.delete', { conversationId });
+      const remaining = conversations.filter((item) => item.id !== conversationId);
+      setConversations(remaining);
+      if (activeId === conversationId) setActiveId(remaining[0]?.id ?? null);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not delete this chat.'); }
+  };
+  const sendMessage = async () => {
+    const text = draft.trim();
+    const conversationId = activeId;
+    if (!text || !conversationId || sending) return;
+    setDraft(''); setSending(true); setError('');
+    const userMessage: ChatMessage = { id: crypto.randomUUID(), role: 'user', content: text, createdAt: new Date().toISOString() };
+    const assistantId = crypto.randomUUID();
+    const pendingAssistant: ChatMessage = { id: assistantId, role: 'assistant', content: '', createdAt: new Date().toISOString() };
+    setMessages((items) => [...items, userMessage, pendingAssistant]);
+    try {
+      const result = await kooduSocket.request<{ reply: string; createdAt: string }>('chats.send', { conversationId, role, text }, {
+        onStream: (event) => setMessages((items) => items.map((message) => message.id !== assistantId ? message : { ...message, content: event.kind === 'reset' ? '' : message.content + event.text })),
+      });
+      setMessages((items) => items.map((message) => message.id !== assistantId ? message : { ...message, content: result.reply, createdAt: result.createdAt }));
+      await loadConversations();
+    } catch (reason) {
+      setMessages((items) => items.filter((message) => message.id !== assistantId));
+      setError(reason instanceof Error ? reason.message : 'The message could not be sent.');
+      void kooduSocket.request<{ messages: ChatMessage[] }>('chats.messages', { conversationId }).then((result) => setMessages(result.messages)).catch(() => {});
+    } finally { setSending(false); }
+  };
+
+  return <section className="chats-layout">
+    <aside className="chat-conversation-panel">
+      <div className="chat-list-heading"><div><strong>Conversations</strong><small>{conversations.length} saved</small></div><button className="product-primary" onClick={() => void createConversation()} aria-label="New conversation" title="New conversation"><AppIcon icon={Add01Icon} size={15}/></button></div>
+      {loading ? <div className="chat-list-empty">Loading conversations…</div> : conversations.length ? <div className="chat-conversation-list">{conversations.map((conversation) => <div className={`chat-conversation-item ${activeId === conversation.id ? 'active' : ''}`} key={conversation.id}><button className="chat-conversation-select" onClick={() => setActiveId(conversation.id)}><strong>{conversation.title}</strong><small>{conversation.messageCount ? `${conversation.messageCount} messages` : 'New conversation'} · {new Date(conversation.updatedAt).toLocaleDateString()}</small></button><button className="chat-delete-button" aria-label={`Delete ${conversation.title}`} title="Delete conversation" onClick={() => void deleteConversation(conversation.id)}><AppIcon icon={Delete02Icon} size={14}/></button></div>)}</div> : <div className="chat-list-empty">No conversations yet.</div>}
+    </aside>
+    <div className="chat-thread">
+      {!activeId ? <div className="chat-welcome"><span className="chat-welcome-mark"><AppIcon icon={Message01Icon} size={22}/></span><strong>Your conversations, in one place.</strong><p>Start a chat to ask Koodu a question or work through a task.</p><button className="product-primary" onClick={() => void createConversation()}><AppIcon icon={Add01Icon} size={15}/> Start a conversation</button></div> : <>
+        <div className="chat-thread-top"><span><i/> PRIVATE CONVERSATION</span><label>MODEL ROUTE<select value={role} onChange={(event) => setRole(event.target.value as 'local' | 'cloud')} disabled={sending}><option value="cloud">Cloud</option><option value="local">Local</option></select></label></div>
+        <div className="chat-message-list" aria-live="polite" ref={messageListRef}>{messages.length ? messages.map((message) => <article className={`chat-message ${message.role}`} key={message.id}><span className="chat-message-author">{message.role === 'user' ? 'YOU' : 'KOODU'}</span><div>{message.content || (sending && message.role === 'assistant' ? <span className="chat-thinking"><i/> Thinking…</span> : '')}</div></article>) : <div className="chat-thread-empty"><strong>What would you like to work on?</strong><span>Your conversation history is saved on the server.</span></div>}</div>
+        <div className="chat-compose"><textarea aria-label="Message Koodu" value={draft} maxLength={1000} disabled={sending} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} placeholder="Message Koodu…" rows={2}/><div><span>ENTER TO SEND · SHIFT + ENTER FOR NEW LINE</span><button className="product-primary" aria-label="Send message" disabled={!draft.trim() || sending} onClick={() => void sendMessage()}>{sending ? <i className="tiny-spinner"/> : <AppIcon icon={ArrowRight01Icon} size={17}/>}</button></div></div>
+      </>}
+      {error && <div className="chat-error" role="alert">{error}</div>}
+    </div>
+  </section>;
+}
+
 function AgentsPage() {
-  const [drafts, setDrafts] = useState<AgentDraft[]>(() => readLocalList<AgentDraft>(AGENT_DRAFTS_KEY));
   const [selected, setSelected] = useState<AgentType | null>(null);
   const [task, setTask] = useState('');
   const [notice, setNotice] = useState('');
-  const saveDraft = () => { if (!selected || !task.trim()) return; const next = [{id:crypto.randomUUID(),type:selected,task:task.trim(),createdAt:Date.now()},...drafts]; setDrafts(next); localStorage.setItem(AGENT_DRAFTS_KEY,JSON.stringify(next)); setTask(''); setNotice('Request saved as a local draft. Agent execution is not connected yet.'); };
+  const [running, setRunning] = useState(false);
+  const [streamText, setStreamText] = useState('');
+  const [result, setResult] = useState<{ taskId: string; reply: string; iterations: number; toolCalls: number } | null>(null);
+  const [error, setError] = useState('');
+  const runTask = async () => {
+    if (!selected || !task.trim() || running) return;
+    setRunning(true); setError(''); setNotice(''); setResult(null); setStreamText('');
+    try {
+      const response = await kooduSocket.request<{ taskId: string; reply: string; iterations: number; toolCalls: number; proposal: unknown; provider: string }>(
+        'agent.run', { role: 'cloud', agentType: selected, text: task.trim(), context: { source: 'agents-page' } },
+        { onStream: (event) => setStreamText((current) => event.kind === 'reset' ? '' : current + event.text) },
+      );
+      setResult(response); setNotice('Task completed and recorded on the server.'); setTask('');
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'The task could not be completed.'); }
+    finally { setRunning(false); }
+  };
   return <div className="product-page agents-page">
-    <div className="agents-runtime"><span className="runtime-icon"><AppIcon icon={AiSecurity02Icon} size={18}/></span><div><strong>Agent runtime not connected</strong><small>Role catalog is ready. Tasks are saved as local drafts until the AgentEngine is available.</small></div><span className="runtime-badge"><i/> PREVIEW</span></div>
-    <div className="section-label-row"><div><strong>Specialists</strong><span>Choose a role to prepare a task request.</span></div><span>{AGENT_TYPES.length} ROLES</span></div>
+    <div className="section-label-row"><div><strong>Specialists</strong><span>Choose an agent focus, then run a task through Koodu’s server agent loop.</span></div><span>{AGENT_TYPES.length} ROLES</span></div>
     <div className="agent-grid">{AGENT_TYPES.map((type,index) => {const info=AGENT_DESCRIPTORS[type];return <button className={`agent-card ${selected===type?'selected':''}`} key={type} onClick={() => setSelected(type)}><span className="agent-avatar"><AppIcon icon={[AiSecurity02Icon, CpuIcon, DashboardSpeed01Icon, Layers01Icon][index] ?? AiSecurity02Icon} size={20}/></span><span className="agent-card-copy"><strong>{info.title}</strong><small>{info.description}</small></span><span className={`risk-pill ${info.risk}`}>{info.risk.toUpperCase()}</span></button>;})}</div>
-    {selected && <section className="task-composer"><div className="composer-title"><div><strong>Prepare a task</strong><small>{AGENT_DESCRIPTORS[selected].title}</small></div><button aria-label="Close task composer" onClick={() => setSelected(null)}><AppIcon icon={Cancel01Icon} size={15}/></button></div><textarea rows={3} value={task} onChange={(e)=>setTask(e.target.value)} placeholder={`Describe a task for the ${AGENT_DESCRIPTORS[selected].title}…`}/><div className="composer-bottom"><span>Saved locally as a draft. No agent will run yet.</span><button className="product-primary" disabled={!task.trim()} onClick={saveDraft}><AppIcon icon={Add01Icon} size={15}/> Save request</button></div></section>}
+    {selected && <section className="task-composer"><div className="composer-title"><div><strong>Run a task</strong><small>{AGENT_DESCRIPTORS[selected].title}</small></div><button aria-label="Close task composer" disabled={running} onClick={() => setSelected(null)}><AppIcon icon={Cancel01Icon} size={15}/></button></div><textarea rows={3} maxLength={1000} value={task} disabled={running} onChange={(e)=>setTask(e.target.value)} placeholder={`Describe a task for the ${AGENT_DESCRIPTORS[selected].title}…`}/><div className="composer-bottom"><span>Runs on the server · {task.length} / 1000</span><button className="product-primary" disabled={!task.trim()||running} onClick={()=>void runTask()}>{running?<i className="tiny-spinner"/>:<AppIcon icon={SparklesIcon} size={15}/>} {running?'Working…':'Run task'}</button></div></section>}
     {notice && <div className="draft-notice"><AppIcon icon={Tick02Icon} size={14}/>{notice}<button onClick={()=>setNotice('')} aria-label="Dismiss"><AppIcon icon={Cancel01Icon} size={13}/></button></div>}
-    <div className="section-label-row task-list-heading"><div><strong>Task requests</strong><span>{drafts.length ? 'Local drafts awaiting the agent runtime.' : 'Requests you prepare will appear here.'}</span></div><span>{drafts.length.toString().padStart(2,'0')}</span></div>
-    {drafts.length ? <div className="draft-list">{drafts.map((draft)=><article className="draft-row" key={draft.id}><span className="draft-status"/><div><strong>{draft.task}</strong><small>{AGENT_DESCRIPTORS[draft.type].title} · Draft · {new Date(draft.createdAt).toLocaleString()}</small></div><button title="Remove draft" aria-label="Remove draft" onClick={()=>{const next=drafts.filter(d=>d.id!==draft.id);setDrafts(next);localStorage.setItem(AGENT_DRAFTS_KEY,JSON.stringify(next));}}><AppIcon icon={Delete02Icon} size={15}/></button></article>)}</div>:<div className="agent-empty">No task requests yet <span>·</span> select a specialist above to prepare one.</div>}
-    <div className="page-footnote">Requests remain drafts; task execution, progress, and cancellation require the AgentEngine integration.</div>
+    {error && <div className="memory-error-toast" role="alert"><span className="memory-error-mark">!</span>{error}</div>}
+    <div className="section-label-row task-list-heading"><div><strong>Latest run</strong><span>Task output is kept in this page session; task status is recorded server-side.</span></div>{result && <span>{result.iterations} STEPS · {result.toolCalls} TOOLS</span>}</div>
+    {running && streamText ? <article className="draft-row"><span className="draft-status"/><div><strong>{streamText}<i className="tiny-spinner"/></strong><small>Streaming response…</small></div></article> : result ? <article className="draft-row"><span className="draft-status"/><div><strong>{result.reply}</strong><small>Task {result.taskId.slice(0,8)} · Completed</small></div></article> : <div className="agent-empty">No task has run in this session <span>·</span> choose a specialist and submit a request.</div>}
   </div>;
 }
 

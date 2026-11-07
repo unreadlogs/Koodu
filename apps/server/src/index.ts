@@ -1,7 +1,7 @@
 import { createServer } from './server';
 import { readConfig } from './config';
 import { initializeDatabase } from './storage/database';
-import { isAbsolute, resolve } from 'node:path';
+import { dirname, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // Node 20.12+ can load a .env file without a dependency.
@@ -21,7 +21,7 @@ const projectRoot = fileURLToPath(new URL('../../../', import.meta.url));
 const databasePath = isAbsolute(config.databasePath) ? config.databasePath : resolve(projectRoot, config.databasePath);
 const database = initializeDatabase(databasePath);
 console.log(`[koodu-server] SQLite ready: ${databasePath}`);
-const app = createServer(config, { database });
+const app = createServer(config, { database, logFilePath: resolve(dirname(databasePath), 'koodu.log.jsonl') });
 app.addHook('onClose', async () => { database.close(); });
 
 app

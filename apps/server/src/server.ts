@@ -1,7 +1,7 @@
-import { timingSafeEqual, randomBytes } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { timingSafeEqual, randomBytes, randomUUID } from 'node:crypto';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, watch, writeFileSync, type FSWatcher } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -13,6 +13,9 @@ import { createOpenAiRuntime } from './inference/openai';
 import { InferenceError, type InferenceRuntime } from './inference/types';
 import Database from 'better-sqlite3';
 import { initializeDatabase } from './storage/database';
+import { MainAgent } from './agent/main-agent';
+import { AgentEngine } from './agent/agent-engine';
+import { sanitizeEmbeddingText } from './inference/embedding';
 
 /** Bound both the byte size and the shape of untrusted request bodies. */
 const contextSchema = z
@@ -39,17 +42,27 @@ const managedModelSchema = z.object({
   clearApiKey: z.boolean().optional(),
 });
 type ManagedModel = Omit<z.infer<typeof managedModelSchema>, 'apiKey'> & { apiKey: string | null };
+const starterSkills = [
+  { id: 'starter-research-brief', name: 'Research brief', description: 'Turn a question into a concise, sourced research outline.', category: 'Research', instructions: 'Clarify the question and scope. Gather evidence from reliable sources. Separate verified facts from interpretation, cite sources, and finish with a short summary and open questions.', enabled: true, source: 'Koodu starter' },
+  { id: 'starter-code-review', name: 'Code review', description: 'Review a change for correctness, risk, and maintainability.', category: 'Development', instructions: 'Inspect the changed code and its surrounding context. Prioritize concrete bugs and regressions, include file and line references, explain impact, and avoid speculative style feedback.', enabled: true, source: 'Koodu starter' },
+  { id: 'starter-task-plan', name: 'Task planner', description: 'Break a larger request into clear, verifiable steps.', category: 'Organization', instructions: 'Restate the desired outcome, identify dependencies, split the work into small ordered steps, call out unresolved decisions, and define how completion can be verified.', enabled: true, source: 'Koodu starter' },
+] as const;
 
 export interface ServerDeps {
   local?: InferenceRuntime;
   cloud?: InferenceRuntime;
   database?: Database.Database;
+  logFilePath?: string;
 }
+
+type ServerLogEntry = { id: string; at: number; level: 'info' | 'success' | 'warning' | 'error'; source: string; message: string; detail: string | null };
 
 export function createServer(config: ServerConfig, deps: ServerDeps = {}): FastifyInstance {
   const app = Fastify({ logger: false, bodyLimit: 16 * 1024 });
   const ownsDatabase = !deps.database;
   const database = deps.database ?? initializeDatabase(':memory:');
+  const mainAgent = new MainAgent({ database });
+  const agentEngine = new AgentEngine(database, mainAgent);
   const managedModels = new Map<string, ManagedModel>();
   const managedModelUsage = new Map<string, { month: string; tokens: number }>();
   const storedProfiles = database.prepare('SELECT * FROM model_profiles').all() as Array<Record<string, any>>;
@@ -61,6 +74,79 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
     VALUES (@id,@name,@provider,@model,@baseUrl,@role,@maxOutputTokens,@monthlyTokenLimit,@enabled,@active,@apiKey,CURRENT_TIMESTAMP)
     ON CONFLICT(id) DO UPDATE SET name=excluded.name,provider=excluded.provider,model=excluded.model,base_url=excluded.base_url,role=excluded.role,max_output_tokens=excluded.max_output_tokens,monthly_token_limit=excluded.monthly_token_limit,enabled=excluded.enabled,active=excluded.active,api_key=excluded.api_key,updated_at=CURRENT_TIMESTAMP`);
   const saveProfile = (profile: ManagedModel) => persistModel.run({ ...profile, enabled: Number(profile.enabled), active: Number(profile.active) });
+  const upsertSkill = database.prepare(`INSERT INTO skills (id,name,description,category,instructions,enabled,source,updated_at)
+    VALUES (@id,@name,@description,@category,@instructions,@enabled,@source,@updatedAt)
+    ON CONFLICT(id) DO UPDATE SET name=excluded.name,description=excluded.description,category=excluded.category,instructions=excluded.instructions,enabled=excluded.enabled,source=excluded.source,updated_at=excluded.updated_at`);
+  const writeSkill = (skill: {id:string;name:string;description:string;category:string;instructions:string;enabled:boolean;source:string}) => upsertSkill.run({...skill,enabled:Number(skill.enabled),updatedAt:Date.now()});
+  const readSkills = () => (database.prepare('SELECT id,name,description,category,instructions,enabled,source,updated_at AS updatedAt FROM skills ORDER BY updated_at DESC,name COLLATE NOCASE').all() as Array<Record<string, any>>).map((skill) => ({...skill,enabled:Boolean(skill.enabled),updatedAt:Number(skill.updatedAt)}));
+  const logFilePath = deps.logFilePath ?? (config.databasePath === ':memory:' ? null : resolve(dirname(config.databasePath), 'koodu.log.jsonl'));
+  const logSubscribers = new Set<WebSocket>();
+  const logCache: ServerLogEntry[] = [];
+  const reloadLogCache = () => {
+    if (!logFilePath || !existsSync(logFilePath)) return;
+    const loaded: ServerLogEntry[] = [];
+    const previous = new Map(logCache.map((entry) => [entry.id, entry]));
+    const lines = readFileSync(logFilePath, 'utf8').split('\n');
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+      const line = lines[lineIndex] ?? '';
+      if (!line.trim()) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        parsed = { message: line.trim() };
+      }
+      if (typeof parsed === 'string') parsed = { message: parsed };
+      if (!parsed || typeof parsed !== 'object' || !('message' in parsed) || typeof parsed.message !== 'string') continue;
+      const candidate = parsed as Record<string, unknown>;
+      const id = typeof candidate.id === 'string' ? candidate.id : `manual-line-${lineIndex}`;
+      const prior = previous.get(id);
+      const level: ServerLogEntry['level'] = candidate.level === 'info' || candidate.level === 'success' || candidate.level === 'warning' || candidate.level === 'error' ? candidate.level : prior?.level ?? 'info';
+      loaded.push({
+        id,
+        at: typeof candidate.at === 'number' && Number.isFinite(candidate.at) ? candidate.at : prior?.at ?? Date.now(),
+        level,
+        source: typeof candidate.source === 'string' ? candidate.source : prior?.source ?? 'manual',
+        message: candidate.message as string,
+        detail: typeof candidate.detail === 'string' ? candidate.detail : prior?.detail ?? null,
+      });
+    }
+    logCache.splice(0, logCache.length, ...loaded.slice(-5000));
+  };
+  const publishLogEntry = (entry: ServerLogEntry) => {
+    const event = JSON.stringify({ type: 'event', event: 'logs.entry', payload: entry });
+    for (const subscriber of logSubscribers) {
+      if (subscriber.readyState === WebSocket.OPEN) { try { subscriber.send(event); } catch { logSubscribers.delete(subscriber); } }
+    }
+  };
+  let logFileWatcher: FSWatcher | null = null;
+  if (logFilePath) {
+    mkdirSync(dirname(logFilePath), { recursive: true });
+    if (!existsSync(logFilePath)) writeFileSync(logFilePath, '');
+    reloadLogCache();
+    logFileWatcher = watch(dirname(logFilePath), (_event, filename) => {
+      if (filename && basename(String(filename)) !== basename(logFilePath)) return;
+      try {
+        const previous = new Map(logCache.map((entry) => [entry.id, JSON.stringify(entry)]));
+        reloadLogCache();
+        for (const entry of logCache) if (previous.get(entry.id) !== JSON.stringify(entry)) publishLogEntry(entry);
+      } catch { /* Ignore transient file reads during append/rotation. */ }
+    });
+  }
+  const recordServerLog = (level: 'info' | 'success' | 'warning' | 'error', source: string, message: string, detail?: string) => {
+    try {
+      const entry: ServerLogEntry = { id: randomUUID(), at: Date.now(), level, source, message, detail: detail ?? null };
+      const compact = logCache.length >= 5000;
+      logCache.push(entry);
+      if (logCache.length > 5000) logCache.shift();
+      if (logFilePath) {
+        mkdirSync(dirname(logFilePath), { recursive: true });
+        if (compact) writeFileSync(logFilePath, `${logCache.map((item) => JSON.stringify(item)).join('\n')}\n`);
+        else appendFileSync(logFilePath, `${JSON.stringify(entry)}\n`);
+      }
+      publishLogEntry(entry);
+    } catch { /* Logging must not break server requests. */ }
+  };
 
   // Static assets: server serves public/companion/ (auto-synced from assets/companion/).
   // Generated by scripts/sync-assets.mjs (prestart/predev) — git-ignored.
@@ -333,11 +419,20 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
         const { id, method } = request.data;
         const parsed = rpcPayloadSchemas[method].safeParse(request.data.payload);
         if (!parsed.success) {
-          reply({ type: 'response', id, ok: false, error: { code: 'invalid_request', details: parsed.error.flatten() } });
+          reply({ type: 'response', id, ok: false, error: 'The request payload is invalid.', error_code: 'invalid_request', details: parsed.error.flatten() });
           return;
         }
         const ok = (result: unknown) => reply({ type: 'response', id, ok: true, result });
-        const fail = (code: string, message?: string, details?: unknown) => reply({ type: 'response', id, ok: false, error: { code, ...(message ? { message } : {}), ...(details === undefined ? {} : { details }) } });
+        const defaultErrorMessages: Record<string, string> = {
+          unauthorized: 'Authentication is required for this action.',
+          internal_error: 'The server could not complete the request.',
+          invalid_request: 'The request payload is invalid.',
+          invalid_memory: 'The memory text is empty after applying the safe length limit.',
+          not_configured: 'The requested model provider is not configured.',
+          timeout: 'The request timed out. Please try again.',
+          unavailable: 'The requested service is currently unavailable.',
+        };
+        const fail = (code: string, message?: string, details?: unknown) => reply({ type: 'response', id, ok: false, error: message ?? defaultErrorMessages[code] ?? 'The request could not be completed.', error_code: code, ...(details === undefined ? {} : { details }) });
         const requireAuth = () => { if (authenticated) return true; fail('unauthorized'); return false; };
         try {
           switch (method) {
@@ -384,11 +479,12 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
               const saved = { ...profile, apiKey } as ManagedModel;
               managedModels.set(profile.id, saved);
               saveProfile(saved);
+              recordServerLog('success', 'models', `Model profile “${profile.name}” was ${previous ? 'updated' : 'created'}.`, `Provider: ${profile.provider} · Model: ${profile.model} · Route: ${profile.role}.`);
               ok({ ...profile, apiKeySet: Boolean(apiKey) }); return;
             }
             case 'models.delete': {
               if (!requireAuth()) return;
-              { const id = (parsed.data as { id: string }).id; const deleted = managedModels.delete(id); database.prepare('DELETE FROM model_profiles WHERE id = ?').run(id); managedModelUsage.delete(id); ok({ ok: deleted }); } return;
+              { const id = (parsed.data as { id: string }).id; const profile = managedModels.get(id); const deleted = managedModels.delete(id); database.prepare('DELETE FROM model_profiles WHERE id = ?').run(id); managedModelUsage.delete(id); if (deleted && profile) recordServerLog('warning', 'models', `Model profile “${profile.name}” was deleted.`, `Route: ${profile.role}.`); ok({ ok: deleted }); } return;
             }
             case 'models.test': {
               if (!requireAuth()) return;
@@ -397,9 +493,10 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
               if (!profile.apiKey) { fail('api_key_missing'); return; }
               try {
                 const response = await fetch(`${profile.baseUrl.replace(/\/+$/, '')}/models`, { headers: { authorization: `Bearer ${profile.apiKey}` }, signal: AbortSignal.timeout(config.timeoutMs) });
-                if (!response.ok) { fail('provider_rejected_request', undefined, { status: response.status }); return; }
+                if (!response.ok) { recordServerLog('warning', 'models', `Connection test failed for “${profile.name}”.`, `Provider returned HTTP ${response.status}.`); fail('provider_rejected_request', undefined, { status: response.status }); return; }
+                recordServerLog('success', 'models', `Connection test succeeded for “${profile.name}”.`, `Provider: ${profile.provider} · Model: ${profile.model}.`);
                 ok({ ok: true, provider: profile.provider, model: profile.model });
-              } catch { fail('provider_unreachable'); }
+              } catch { recordServerLog('error', 'models', `Connection test failed for “${profile.name}”.`, 'The provider endpoint could not be reached.'); fail('provider_unreachable'); }
               return;
             }
             case 'usage.summary': {
@@ -413,6 +510,87 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
               const recent = database.prepare('SELECT id,occurred_at,model_id,provider,route,input_tokens,output_tokens,latency_ms,outcome,error_code FROM usage_events WHERE occurred_at >= ? ORDER BY occurred_at DESC LIMIT 20').all(since);
               const daily = database.prepare(`SELECT strftime('%Y-%m-%d', occurred_at/1000, 'unixepoch') day, COUNT(*) calls, SUM(input_tokens+output_tokens) tokens FROM usage_events WHERE occurred_at >= ? GROUP BY day ORDER BY day`).all(since);
               ok({ range, since, summary, recent, daily }); return;
+            }
+            case 'logs.watch': {
+              if (!requireAuth()) return;
+              reloadLogCache();
+              logSubscribers.add(ws);
+              ok({ entries: logCache.slice(-500).reverse() }); return;
+            }
+            case 'logs.unwatch': {
+              logSubscribers.delete(ws);
+              ok({ ok: true }); return;
+            }
+            case 'logs.clear': {
+              if (!requireAuth()) return;
+              logCache.length = 0;
+              if (logFilePath) { mkdirSync(dirname(logFilePath), { recursive: true }); writeFileSync(logFilePath, ''); }
+              ok({ ok: true }); return;
+            }
+            case 'memory.list': {
+              if (!requireAuth()) return;
+              ok({ memories: await mainAgent.memory.list() }); return;
+            }
+            case 'memory.save': {
+              if (!requireAuth()) return;
+              const payload = parsed.data as { id?: number; content: string; category: 'preference' | 'fact' | 'task' };
+              const clean = sanitizeEmbeddingText(payload.content);
+              if (!clean) { fail('invalid_memory', 'Memory content is empty after applying the embedding safety limit.'); return; }
+              if (payload.id) {
+                await mainAgent.memory.update(payload.id, clean, payload.category);
+                recordServerLog('success', 'memory', 'A memory was updated.', `Category: ${payload.category} · Record: ${payload.id}.`);
+              } else {
+                const id = await mainAgent.memory.add(clean, payload.category);
+                recordServerLog('success', 'memory', 'A memory was created.', `Category: ${payload.category} · Record: ${id}.`);
+              }
+              ok({ memories: await mainAgent.memory.list() }); return;
+            }
+            case 'memory.delete': {
+              if (!requireAuth()) return;
+              const id = (parsed.data as { id: number }).id;
+              const existed = database.prepare('SELECT 1 FROM memories WHERE id = ?').get(id);
+              mainAgent.memory.delete(id);
+              if (existed) recordServerLog('warning', 'memory', 'A memory was deleted.', `Record: ${id}.`);
+              ok({ memories: await mainAgent.memory.list() }); return;
+            }
+            case 'skills.list': {
+              if (!requireAuth()) return;
+              const seeded = database.prepare("SELECT 1 FROM app_settings WHERE key = 'skills.starter-seeded.v1'").get();
+              if (!seeded) {
+                const seed = database.transaction(() => {
+                  for (const skill of starterSkills) {
+                    database.prepare(`INSERT OR IGNORE INTO skills (id,name,description,category,instructions,enabled,source,updated_at) VALUES (?,?,?,?,?,?,?,?)`)
+                      .run(skill.id,skill.name,skill.description,skill.category,skill.instructions,Number(skill.enabled),skill.source,Date.now());
+                  }
+                  database.prepare("INSERT INTO app_settings (key,value_json) VALUES ('skills.starter-seeded.v1','true')").run();
+                });
+                seed();
+              }
+              ok({ skills: readSkills(), persistence: 'sqlite' }); return;
+            }
+            case 'skills.save': {
+              if (!requireAuth()) return;
+              const skill = parsed.data as {id:string;name:string;description:string;category:string;instructions:string;enabled:boolean;source:string};
+              const existed = database.prepare('SELECT 1 FROM skills WHERE id = ?').get(skill.id);
+              writeSkill(skill);
+              recordServerLog('success', 'skills', `Skill “${skill.name}” was ${existed ? 'updated' : 'created'}.`, `Category: ${skill.category} · ${skill.enabled ? 'Enabled' : 'Disabled'}.`);
+              ok({ skills: readSkills() }); return;
+            }
+            case 'skills.delete': {
+              if (!requireAuth()) return;
+              const id = (parsed.data as {id:string}).id;
+              const skill = database.prepare('SELECT name FROM skills WHERE id = ?').get(id) as {name:string}|undefined;
+              database.prepare('DELETE FROM skills WHERE id = ?').run(id);
+              if (skill) recordServerLog('warning', 'skills', `Skill “${skill.name}” was deleted.`);
+              ok({ skills: readSkills() }); return;
+            }
+            case 'skills.import': {
+              if (!requireAuth()) return;
+              const incoming = (parsed.data as {skills:Array<{id:string;name:string;description:string;category:string;instructions:string;enabled:boolean;source:string}>}).skills;
+              const importSkills = database.transaction(() => { for (const skill of incoming) writeSkill(skill); });
+              importSkills();
+              recordServerLog('success', 'skills', `${incoming.length} skill${incoming.length === 1 ? '' : 's'} were imported.`, 'Skill definitions were added to the server library.');
+              ok({ skills: readSkills(), imported: incoming.length }); return;
             }
             case 'intelligence.complete': {
               if (!requireAuth()) return;
@@ -431,10 +609,109 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
                   const month = new Date().toISOString().slice(0, 7); const previous = managedModelUsage.get(managed.id);
                   managedModelUsage.set(managed.id, { month, tokens: (previous?.month === month ? previous.tokens : 0) + result.usage.totalTokens });
                 }
+                recordServerLog('success', 'inference', `${payload.role === 'cloud' ? 'Cloud' : 'Local'} inference completed.`, `Provider: ${selectedRuntime.id}.`);
                 ok(result);
               } catch (error) {
                 const code = error instanceof InferenceError ? error.code : 'unavailable';
+                recordServerLog('error', 'inference', `${payload.role === 'cloud' ? 'Cloud' : 'Local'} inference failed.`, `Error code: ${code}.`);
                 fail(code, undefined, { provider: selectedRuntime.id });
+              }
+              return;
+            }
+            case 'chats.list': {
+              if (!requireAuth()) return;
+              const conversations = database.prepare(`SELECT c.id,c.title,c.created_at AS createdAt,c.updated_at AS updatedAt,COUNT(m.id) AS messageCount
+                FROM chat_conversations c LEFT JOIN chat_messages m ON m.conversation_id=c.id GROUP BY c.id ORDER BY c.updated_at DESC`).all();
+              ok({ conversations }); return;
+            }
+            case 'chats.create': {
+              if (!requireAuth()) return;
+              const payload = parsed.data as { title?: string };
+              const id = randomUUID(); const now = new Date().toISOString();
+              database.prepare('INSERT INTO chat_conversations (id,title,created_at,updated_at) VALUES (?,?,?,?)').run(id, payload.title?.trim() || 'New chat', now, now);
+              ok({ conversation: { id, title: payload.title?.trim() || 'New chat', createdAt: now, updatedAt: now, messageCount: 0 } }); return;
+            }
+            case 'chats.delete': {
+              if (!requireAuth()) return;
+              const { conversationId } = parsed.data as { conversationId: string };
+              const result = database.prepare('DELETE FROM chat_conversations WHERE id=?').run(conversationId);
+              ok({ deleted: result.changes > 0 }); return;
+            }
+            case 'chats.messages': {
+              if (!requireAuth()) return;
+              const { conversationId } = parsed.data as { conversationId: string };
+              const messages = database.prepare('SELECT id,role,content,created_at AS createdAt FROM chat_messages WHERE conversation_id=? ORDER BY created_at,id').all(conversationId);
+              ok({ messages }); return;
+            }
+            case 'chats.send': {
+              if (!requireAuth()) return;
+              const payload = parsed.data as { conversationId: string; role: 'local' | 'cloud'; text: string };
+              const conversation = database.prepare('SELECT id,title FROM chat_conversations WHERE id=?').get(payload.conversationId) as { id: string; title: string } | undefined;
+              if (!conversation) { fail('conversation_not_found'); return; }
+              const now = new Date().toISOString();
+              database.prepare('INSERT INTO chat_messages (id,conversation_id,role,content,created_at) VALUES (?,?,\'user\',?,?)').run(randomUUID(), conversation.id, payload.text, now);
+              if (conversation.title === 'New chat') {
+                const title = payload.text.replace(/\s+/g, ' ').slice(0, 56) || 'New chat';
+                database.prepare('UPDATE chat_conversations SET title=?,updated_at=? WHERE id=?').run(title, now, conversation.id);
+              } else database.prepare('UPDATE chat_conversations SET updated_at=? WHERE id=?').run(now, conversation.id);
+              const recent = database.prepare(`SELECT role,content FROM chat_messages WHERE conversation_id=? ORDER BY created_at DESC,id DESC LIMIT 20`).all(conversation.id) as Array<{role:'user'|'assistant';content:string}>;
+              const context = { conversation: recent.reverse().map((message) => ({ role: message.role, content: message.content.slice(0, 4_000) })) };
+              const runtime = payload.role === 'local' ? local : cloud;
+              const managed = [...managedModels.values()].find((item) => item.enabled && item.active && item.role === runtime.kind);
+              const selectedRuntime = managed ? createOpenAiRuntime({ id: managed.id, kind: runtime.kind, baseUrl: managed.baseUrl, model: managed.model, apiKey: managed.apiKey, timeoutMs: config.timeoutMs, maxOutputTokens: managed.maxOutputTokens }) : runtime;
+              if (managed && managed.monthlyTokenLimit > 0) {
+                const month = new Date().toISOString().slice(0, 7); const usage = managedModelUsage.get(managed.id);
+                if (usage?.month === month && usage.tokens >= managed.monthlyTokenLimit) { fail('monthly_token_limit_reached', undefined, { provider: managed.id }); return; }
+              }
+              if (!selectedRuntime.configured()) { fail('not_configured', undefined, { provider: selectedRuntime.id }); return; }
+              const controller = new AbortController(); const abortOnClose = () => controller.abort(); ws.once('close', abortOnClose);
+              try {
+                const result = await agentEngine.run({ text: payload.text, context, runtime: selectedRuntime, signal: controller.signal,
+                  onTextDelta: (text) => reply({ type: 'event', event: 'agent.stream', requestId: id, payload: { kind: 'delta', text } }),
+                  onTextReset: () => reply({ type: 'event', event: 'agent.stream', requestId: id, payload: { kind: 'reset' } }),
+                });
+                const createdAt = new Date().toISOString();
+                database.prepare('INSERT INTO chat_messages (id,conversation_id,role,content,created_at) VALUES (?,?,\'assistant\',?,?)').run(randomUUID(), conversation.id, result.reply, createdAt);
+                database.prepare('UPDATE chat_conversations SET updated_at=? WHERE id=?').run(createdAt, conversation.id);
+                ok({ ...result, conversationId: conversation.id, createdAt });
+              } catch (error) {
+                const code = error instanceof InferenceError ? error.code : controller.signal.aborted ? 'cancelled' : 'agent_failed';
+                fail(code);
+              } finally { ws.removeListener('close', abortOnClose); }
+              return;
+            }
+            case 'agent.run': {
+              if (!requireAuth()) return;
+              const payload = parsed.data as { role: 'local' | 'cloud'; agentType?: 'research' | 'coding' | 'organizer' | 'memory'; text: string; context: Record<string, unknown> };
+              const runtime = payload.role === 'local' ? local : cloud;
+              const managed = [...managedModels.values()].find((item) => item.enabled && item.active && item.role === runtime.kind);
+              const selectedRuntime = managed ? createOpenAiRuntime({ id: managed.id, kind: runtime.kind, baseUrl: managed.baseUrl, model: managed.model, apiKey: managed.apiKey, timeoutMs: config.timeoutMs, maxOutputTokens: managed.maxOutputTokens }) : runtime;
+              if (managed && managed.monthlyTokenLimit > 0) {
+                const month = new Date().toISOString().slice(0, 7); const usage = managedModelUsage.get(managed.id);
+                if (usage?.month === month && usage.tokens >= managed.monthlyTokenLimit) { fail('monthly_token_limit_reached', undefined, { provider: managed.id }); return; }
+              }
+              if (!selectedRuntime.configured()) { fail('not_configured', undefined, { provider: selectedRuntime.id }); return; }
+              const controller = new AbortController();
+              const abortOnClose = () => controller.abort();
+              ws.once('close', abortOnClose);
+              try {
+                const result = await agentEngine.run({
+                  text: payload.text,
+                  context: payload.context,
+                  runtime: selectedRuntime,
+                  agentType: payload.agentType,
+                  signal: controller.signal,
+                  onTextDelta: (text) => reply({ type: 'event', event: 'agent.stream', requestId: id, payload: { kind: 'delta', text } }),
+                  onTextReset: () => reply({ type: 'event', event: 'agent.stream', requestId: id, payload: { kind: 'reset' } }),
+                });
+                recordServerLog('success', 'agent', 'The companion completed a request.', `Task: ${result.taskId}. Steps: ${result.iterations}. Tools: ${result.toolCalls}.`);
+                ok(result);
+              } catch (error) {
+                const code = error instanceof InferenceError ? error.code : controller.signal.aborted ? 'cancelled' : 'agent_failed';
+                recordServerLog(controller.signal.aborted ? 'warning' : 'error', 'agent', controller.signal.aborted ? 'The companion request was cancelled.' : 'The companion could not complete a request.', `Error code: ${code}.`);
+                fail(code);
+              } finally {
+                ws.removeListener('close', abortOnClose);
               }
               return;
             }
@@ -447,11 +724,14 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
     ws.on('error', () => {
       // ignore
     });
+    ws.on('close', () => logSubscribers.delete(ws));
   });
 
   app.addHook('onClose', async () => {
     for (const client of wss.clients) client.terminate();
     await new Promise<void>((resolve) => wss.close(() => resolve()));
+    logFileWatcher?.close();
+    await mainAgent.close();
     if (ownsDatabase) database.close();
   });
 
