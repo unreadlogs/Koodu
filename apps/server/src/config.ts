@@ -16,6 +16,8 @@ export interface ServerConfig {
   cloud: ProviderConfig;
   publicDir: string;
   databasePath: string;
+  /** Sandboxed root for agent file tools. */
+  workspaceDir: string;
 }
 
 const nonEmpty = (value: string | undefined): string | null => {
@@ -62,5 +64,6 @@ export function readConfig(env: Record<string, string | undefined> = process.env
     },
     publicDir: nonEmpty(env.SERVER_PUBLIC_DIR) ?? 'public',
     databasePath: nonEmpty(env.KOODU_DATABASE_PATH) ?? 'assets/database/koodu.sqlite',
+    workspaceDir: nonEmpty(env.KOODU_WORKSPACE_DIR) ?? 'assets/workspace',
   };
 }

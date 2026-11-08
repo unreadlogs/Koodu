@@ -32,7 +32,7 @@ class KooduSocket {
     await this.whenReady();
     if (this.pending.size >= 128) throw new Error('Too many pending WebSocket requests.');
     const id = crypto.randomUUID();
-    const timeoutMs = options.timeoutMs ?? (method === 'agent.run' || method === 'chats.send' ? 120_000 : 30_000);
+    const timeoutMs = options.timeoutMs ?? (method === 'agent.run' || method === 'agent.resume' || method === 'chats.send' ? 120_000 : 30_000);
     return new Promise<T>((resolve, reject) => {
       const timer = window.setTimeout(() => {
         this.pending.delete(id);

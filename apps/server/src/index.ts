@@ -19,9 +19,10 @@ if (typeof loadEnvFile === 'function') {
 const config = readConfig();
 const projectRoot = fileURLToPath(new URL('../../../', import.meta.url));
 const databasePath = isAbsolute(config.databasePath) ? config.databasePath : resolve(projectRoot, config.databasePath);
+const workspaceDir = isAbsolute(config.workspaceDir) ? config.workspaceDir : resolve(projectRoot, config.workspaceDir);
 const database = initializeDatabase(databasePath);
 console.log(`[koodu-server] SQLite ready: ${databasePath}`);
-const app = createServer(config, { database, logFilePath: resolve(dirname(databasePath), 'koodu.log.jsonl') });
+const app = createServer({ ...config, workspaceDir }, { database, logFilePath: resolve(dirname(databasePath), 'koodu.log.jsonl') });
 app.addHook('onClose', async () => { database.close(); });
 
 app

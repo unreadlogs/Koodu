@@ -1,104 +1,93 @@
 # Koodu
 
-An open-source AI agent environment with a persistent companion, multi-agent orchestration, hybrid local-cloud intelligence, and an interactive multi-tab workspace.
+> An open-source AI agent environment for the web — a persistent companion, a multi-agent runtime, hybrid local/cloud intelligence, and a stateful multi-tab workspace, all coordinated through a central middleware layer.
 
-The repository contains the vertical prototype:
 
-- `apps/web` — React shell, workspace iframes and browser engines.
-- `apps/server` — Fastify API; **all inference and secrets stay here**.
-- `protocol` — `@koodu/protocol`, the shared TypeScript/Zod contracts used by the web app and server.
-- `assets/companion/` — input spritesheets and manifests; the image renderer is still intentionally pending.
+> ✌️ **Active development.** Koodu is a working vertical prototype, not a finished product. Expect rough edges, half-wired features, and breaking changes between commits. The architecture is settling, the UI is being refined, and several engines (voice, personality, memory curation, full action execution) are still in progress. If you spot something broken or want to help shape where it goes, issues and pull requests are very welcome — happy to have you along.
 
-## Prerequisites
+## What it is
 
-- Node.js **22.18+**
-- pnpm 12.x (pinned in root `package.json`)
-- Linux, macOS, or Windows with WASM/WebAssembly and module workers available in Node.js
+Koodu is not a chatbot with an animated avatar. It is an **agent operating environment**: a persistent companion (floating or embedded) sits above a workspace of internal tabs, and every action the AI proposes passes through a central middleware that validates, authorizes, and executes it. Models and sub-agents never touch UI state directly.
+
+The companion reacts to what the system is doing, but it does not own the system's state.
+
+## Highlights
+
+- **Persistent companion** — Kumo (panda) and Kitsu (kitsune), selectable in Settings, with manifest-driven sprite animation. Floating, embedded, or hidden display modes.
+- **Stateful workspace** — internal routes (`/workspace/usage`, `/workspace/models`, `/workspace/agents`, `/workspace/chats`, `/workspace/memory`, `/workspace/logs`, `/workspace/skills`, `/workspace/settings`) rendered in persistent tabs.
+- **Central middleware** — single authority for application state, event bus, action registry, permission checks, and persistence. All model output is validated before execution.
+- **Hybrid intelligence** — local inference for simple, latency-sensitive commands; cloud for complex reasoning. Confidence-based fallback.
+- **Agent orchestration** — a main companion agent coordinates Research, Coding, Organizer, and Memory sub-agents with task lifecycle tracking.
+- **Server-side secrets** — inference runs on the Fastify server. API keys never reach the browser.
+- **Durable storage** — SQLite on the server (model profiles, skills, memory, chats, settings, usage). Browser keeps only a validated write-through cache.
+
+## Architecture
+
+Five independent engines coordinated by middleware:
+
+| Engine | Responsibility |
+|---|---|
+| `PetEngine` | Avatar rendering, animation, activity/emotion/display state |
+| `WorkspaceEngine` | Tab and iframe lifecycles, layout, persistence |
+| `MiddlewareEngine` | Central state, event bus, action registry, validation, permissions |
+| `IntelligenceEngine` | Local/cloud routing, intent proposals, fallback |
+| `AgentEngine` | Main agent + sub-agent orchestration, task lifecycle |
+
+Engines communicate through defined interfaces and events. They are independently replaceable.
 
 ## Quick start
+
+**Prerequisites:** Node.js 22.18+, pnpm 12.x.
 
 ```sh
 pnpm install
 cp .env.example .env
-pnpm dev               # web on :5173, server API on :8787
+pnpm dev               # web on :5173, server on :8787
 ```
 
-Open <http://localhost:5173>. The Vite frontend proxies `/api` to
-`http://127.0.0.1:8787`; do not expose the backend directly in normal development.
+Open <http://localhost:5173>. The Vite dev server proxies `/api` and `/ws` to the backend.
 
-To run them separately:
+Run them separately:
 
 ```sh
 pnpm dev:server       # http://127.0.0.1:8787
 pnpm dev:web          # http://localhost:5173
 ```
 
-## Verify the install
+## Verify
 
 ```sh
 curl http://127.0.0.1:8787/api/health
-```
-
-Run the test/type/build suite:
-
-```sh
 pnpm typecheck
 pnpm test
 pnpm --filter @koodu/web build
 ```
 
-## Local inference
-
-Both local and cloud inference run server-side and route through the middleware before any action is executed.
-
-`.env`:
-
-```env
-LOCAL_LLM_BASE_URL=http://127.0.0.1:11434/v1
-LOCAL_LLM_MODEL=local-model
-# LOCAL_LLM_API_KEY=
-```
-
-No additional download is required. The local provider accepts any OpenAI-compatible endpoint (Ollama, llama.cpp server, vLLM).
-
-Local inference is limited to local-safe actions. `spawn_subagent` and `cancel_task`
-are never proposed by the local model; they require cloud routing and explicit
-user approval. See `docs/adr/0001-server-side-local-inference.md`.
-
-## Not configured / 501
-
-If the local provider is disabled, `/api/intelligence/local` returns:
-
-```json
-{ "error": "not_configured", "provider": "local" }
-```
-
-The UI still works: browser rules handle canonical commands; intelligence is optional.
-
-## Environment
-
-Copy `.env.example` to `.env`. `.env` is git-ignored. Key settings:
-
-- `PORT`, `HOST` — server bind (defaults `8787`, `127.0.0.1`)
-- `ALLOWED_ORIGINS` — browser origins allowed to call the API
-- `KOODU_AUTH_PASSWORD` — optional; if set, the app requires login at `/session/auth`
-- `LOCAL_LLM_BASE_URL`, `LOCAL_LLM_MODEL`, `LOCAL_LLM_API_KEY` — optional local OpenAI-compatible provider
-- `CLOUD_LLM_BASE_URL`, `CLOUD_LLM_MODEL`, `CLOUD_LLM_API_KEY` — optional cloud provider; keys never reach the browser
-- `LLM_TIMEOUT_MS` — local/cloud request timeout (default 15000)
-
-The full example is in `.env.example`.
-
 ## Repository map
 
 ```text
 apps/
-  web/            React shell + workspace + engines (.src/app composition root, engines/)
-  server/         Fastify API and inference adapters
-protocol/         @koodu/protocol: types + Zod schemas shared by web and server
-assets/companion/ Character spritesheets and animation_manifest.json files
+  web/            React shell, workspace, engines, pages
+  server/         Fastify API, inference adapters, SQLite storage
+protocol/         @koodu/protocol — shared TypeScript/Zod contracts
+assets/
+  companion/      Character spritesheets and animation manifests
+  demo/           Screenshots
 docs/adr/         Architecture decisions
 ```
 
+## UI Example
+
+![Koodu home screen](assets/demo/home.png)
+
+
+## Development notes
+
+- All inference and secrets stay server-side. The browser never sees API keys.
+- Model output is never executed directly. It is validated against the action registry and permission system before anything runs.
+- Browser storage is a validated write-through cache only; the server SQLite row is authoritative. Old browser keys are never migrated.
+- Settings, model profiles, skills, memory, chats, and usage are persisted in SQLite and synced over the central WebSocket (`/ws`).
+
 ## License
 
-Apache-2.0.
+MIT

@@ -75,6 +75,28 @@ export function initializeDatabase(path: string): Database.Database {
     );
     CREATE INDEX IF NOT EXISTS chat_messages_conversation_idx ON chat_messages(conversation_id, created_at);
   `);
+  migrateAgentTasks(db);
   return db;
+}
+
+/**
+ * Additive migrations for existing local databases. Columns are only added when
+ * missing, so startup is safe for both fresh and previously created files.
+ */
+function migrateAgentTasks(db: Database.Database): void {
+  const columns = new Set(
+    (db.prepare('PRAGMA table_info(agent_tasks)').all() as Array<{ name: string }>).map((row) => row.name),
+  );
+  const additions: Array<[string, string]> = [
+    ['result', 'result TEXT'],
+    ['error', 'error TEXT'],
+    ['checkpoint_json', 'checkpoint_json TEXT'],
+    ['parent_task_id', 'parent_task_id TEXT'],
+    ['steps', 'steps INTEGER NOT NULL DEFAULT 0'],
+    ['tool_calls', 'tool_calls INTEGER NOT NULL DEFAULT 0'],
+  ];
+  for (const [name, definition] of additions) {
+    if (!columns.has(name)) db.exec(`ALTER TABLE agent_tasks ADD COLUMN ${definition}`);
+  }
 }
 

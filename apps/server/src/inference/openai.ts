@@ -64,7 +64,7 @@ export function createOpenAiRuntime(options: OpenAiRuntimeOptions): InferenceRun
       signal?.addEventListener('abort', forwardAbort, { once: true });
 
       try {
-        const effectiveMaxTokens = Math.max(options.maxOutputTokens ?? 300, 2048);
+        const effectiveMaxTokens = Math.max(options.maxOutputTokens ?? 4096, 4096);
         const response = await doFetch(
           `${options.baseUrl.replace(/\/+$/, '')}/chat/completions`,
           {
@@ -199,14 +199,20 @@ function readPartialReply(content: string): string {
     else if (char === '"') { end = index; break; }
   }
   let raw = content.slice(start, end);
-  while (raw.length) {
+  // A truncated stream cuts mid-escape (e.g. "\u12" or a trailing "\"): drop at most
+  // a few trailing chars so a long reply isn't re-parsed character by character.
+  for (let attempts = 0; attempts <= 12 && raw.length; attempts += 1) {
     try { return JSON.parse(`"${raw}"`) as string; }
     catch { raw = raw.slice(0, -1); }
   }
   return '';
 }
 
-/** Exported for tests: a model reply is untrusted text, not an action. Never throws — always returns a best-effort reply so chat keeps working with small / reasoning models. */
+/**
+ * Safety bound only — far above what max_output_tokens can produce, so legitimate
+ * long replies are never clipped. Raised from a 4k/8k cut that truncated answers mid-sentence.
+ */
+const REPLY_MAX_CHARS = 64_000;
 export function parseModelOutput(
   content: string,
   options: { id: string; kind: 'local' | 'cloud' },
@@ -214,13 +220,26 @@ export function parseModelOutput(
 ): InferenceResponse {
   const usage = totalTokens === undefined ? {} : { usage: { totalTokens } };
   const trimmed = content.trim();
-  const plainFallback = (): InferenceResponse => ({
-    provider: options.id,
-    confidence: 0.5,
-    proposal: null,
-    reply: trimmed ? trimmed.slice(0, 4000) : null,
-    ...usage,
-  });
+  const plainFallback = (): InferenceResponse => {
+    // Truncated JSON (model hit its output limit mid-string): recover the clean
+    // partial reply instead of leaking the raw `{ "action": ... }` blob to the UI.
+    const recovered = readPartialReply(trimmed);
+    if (recovered.trim()) return { provider: options.id, confidence: 0.5, proposal: null, reply: recovered.slice(0, REPLY_MAX_CHARS), ...usage };
+    const candidate = extractJson(trimmed);
+    const looksLikeJson = candidate.startsWith('{') || candidate.startsWith('[');
+    if (looksLikeJson) {
+      // No recoverable reply yet: the streaming path already emitted any clean
+      // text, so a null reply falls back to that instead of showing raw JSON.
+      return { provider: options.id, confidence: 0.5, proposal: null, reply: null, ...usage };
+    }
+    return {
+      provider: options.id,
+      confidence: 0.5,
+      proposal: null,
+      reply: trimmed ? trimmed.slice(0, REPLY_MAX_CHARS) : null,
+      ...usage,
+    };
+  };
 
   let decoded: unknown;
   try {
@@ -251,7 +270,7 @@ export function parseModelOutput(
 
   const rawReply = obj.reply ?? obj.message ?? obj.text ?? obj.answer ?? obj.content;
   let reply: string | null = null;
-  if (typeof rawReply === 'string' && rawReply.trim()) reply = rawReply.slice(0, 4000);
+  if (typeof rawReply === 'string' && rawReply.trim()) reply = rawReply.slice(0, REPLY_MAX_CHARS);
   else if (typeof rawReply === 'number' && Number.isFinite(rawReply)) reply = String(rawReply);
 
   const rawToolCalls = obj.tool_calls ?? obj.toolCalls ?? obj.tools;

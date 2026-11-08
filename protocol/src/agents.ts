@@ -37,6 +37,7 @@ export const AGENT_DESCRIPTORS: Record<AgentType, AgentDescriptor> = {
 export const agentTaskStatusSchema = z.enum([
   'queued',
   'running',
+  'paused',
   'completed',
   'failed',
   'cancelled',

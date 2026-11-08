@@ -1316,3 +1316,82 @@ body{min-width:320px}
 @keyframes chat-pulse{to{opacity:.35;transform:scale(.72)}}
 @media(max-width:760px){.chats-layout{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(96px,155px) minmax(330px,1fr)}.chat-conversation-panel{border-right:0;border-bottom:1px solid #ffffff12}.chat-conversation-list{flex-direction:row;overflow:auto}.chat-conversation-item{min-width:165px;align-self:flex-start}.chat-conversation-item.active{align-self:flex-start}.chat-delete-button{opacity:1}.chat-message-list{padding:18px 14px}.chat-compose-wrap{padding-inline:12px}.chat-thread-meta{display:none}}
 @media(max-width:480px){.chats-layout{grid-template-rows:125px minmax(0,1fr)}.chat-thread-head{height:47px;padding:0 12px}.chat-message-list{gap:20px;padding:16px 12px}.chat-user-bubble{font-size:12px}.chat-assistant-body{font-size:12px}.chat-compose-hint{display:none}.chat-hero>strong{font-size:17px}.chat-hero>p{font-size:11px}.chat-suggestion-chip{font-size:10px}}
+
+/* Chat model profile dropdown (custom, non-native). */
+.chat-model-dropdown{position:relative;flex:none}
+.chat-model-trigger{height:32px;min-width:180px;display:flex;align-items:center;gap:8px;padding:0 10px;border:1px solid #ffffff18;border-radius:7px;background:#15171d;color:#cfd5db;font:9px 'Nova Square',sans-serif;cursor:pointer;transition:border-color .15s,background .15s}
+.chat-model-trigger:hover:not(:disabled){border-color:#9be5ac44;background:#1a1f1a}
+.chat-model-trigger:disabled{opacity:.45;cursor:not-allowed}
+.chat-model-trigger .chat-model-dot{flex:none}
+.chat-model-trigger-label{flex:1;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chat-model-trigger>i{width:7px;height:7px;flex:none;margin-top:-3px;border-right:1px solid #858e97;border-bottom:1px solid #858e97;transform:rotate(45deg);transition:transform .14s}
+.chat-model-trigger[aria-expanded=true]>i{margin-top:4px;transform:rotate(225deg)}
+.chat-model-menu{position:absolute;z-index:40;bottom:calc(100% + 6px);left:0;min-width:240px;max-height:260px;overflow:auto;padding:4px;border:1px solid #ffffff1c;border-radius:8px;background:#15171c;box-shadow:0 12px 32px #0009;display:flex;flex-direction:column;gap:2px}
+.chat-model-menu button{display:flex;align-items:center;gap:9px;padding:8px 9px;border:0;border-radius:5px;background:transparent;color:#aab2ba;font:9px 'Nova Square',sans-serif;text-align:left;cursor:pointer}
+.chat-model-menu button:hover,.chat-model-menu button:focus-visible{outline:none;background:#ffffff0a;color:#e0e5e8}
+.chat-model-menu button.selected{background:#9be5ac0c;color:#9be5ac}
+.chat-model-menu button small{margin-left:auto;color:#78818b;font:8px 'Nova Square',sans-serif}
+.chat-model-menu .chat-model-dot{flex:none}
+.chat-model-menu-label{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media(max-width:600px){.chat-model-trigger{min-width:140px}.chat-model-menu{min-width:200px}}
+
+/* Agent task harness: status, history, resume and cancel controls. */
+.task-status{display:inline-flex;align-items:center;justify-content:center;flex:none;min-width:64px;padding:4px 6px;border:1px solid #ffffff12;border-radius:3px;color:#98a1ab;background:#ffffff06;font:7px var(--mono);letter-spacing:.05em}
+.task-status.running{color:#c5ac77;border-color:#c5ac7738;background:#c5ac770d}
+.task-status.paused{color:#c5ac77;border-color:#c5ac7745;background:#c5ac7712}
+.task-status.completed{color:#9be5ac;border-color:#9be5ac33;background:#9be5ac0c}
+.task-status.failed{color:#e58e8e;border-color:#e58e8e33;background:#e58e8e0c}
+.task-status.cancelled{color:#8b949e;border-color:#ffffff12;background:#ffffff05}
+.task-status.queued{color:#9aa4ae}
+.draft-row.run-result{align-items:flex-start}
+.draft-row.run-result .task-status{margin-top:2px}
+.draft-row.run-result>div strong{white-space:normal;line-height:1.55}
+.task-resume{flex:none;height:27px;display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:0 10px;border:1px solid #9be5ac3d;border-radius:5px;background:#9be5ac0d;color:#a8e6b5;font:8px var(--display);cursor:pointer;transition:background .16s,border-color .16s}
+.task-resume:hover:not(:disabled){background:#9be5ac1a;border-color:#9be5ac66}
+.task-resume:disabled{opacity:.5;cursor:not-allowed}
+.task-cancel{width:27px;height:27px;display:grid;place-items:center;flex:none;border:1px solid #ffffff12;border-radius:5px;background:#15171c;color:#87909a;cursor:pointer}
+.task-cancel:hover:not(:disabled){border-color:#e58e8e38;background:#e58e8e0c;color:#e58e8e}
+.task-cancel:disabled{opacity:.45;cursor:not-allowed}
+.task-refresh{display:inline-flex;align-items:center;gap:5px;padding:4px 7px;border:1px solid #ffffff12;border-radius:5px;background:#14161b;color:#8d969f;font:7px var(--mono);letter-spacing:.04em;cursor:pointer}
+.task-refresh:hover:not(:disabled){color:#d5dbe0;border-color:#ffffff28}
+.task-refresh:disabled{opacity:.5;cursor:not-allowed}
+.task-history{display:flex;flex-direction:column;border:1px solid #ffffff12;border-radius:7px;overflow:hidden}
+.task-history-row{background:#101116}
+.task-history-row+.task-history-row{border-top:1px solid #ffffff0c}
+.task-history-main{width:100%;display:flex;align-items:center;gap:10px;padding:11px 12px;border:0;background:none;color:inherit;text-align:left;cursor:pointer}
+.task-history-main:hover{background:#ffffff04}
+.task-history-copy{display:flex;flex:1;min-width:0;flex-direction:column;gap:5px}
+.task-history-copy strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#d3d7dc;font-size:10px;font-weight:500}
+.task-history-copy small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#737c87;font:7px var(--mono)}
+.task-progress{width:54px;height:3px;flex:none;border-radius:2px;background:#ffffff10;overflow:hidden}
+.task-progress i{display:block;height:100%;background:#c5ac77;transition:width .3s}
+.task-history-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;padding:0 12px 10px}
+.task-history-actions:empty{display:none}
+.task-history-detail{padding:0 12px 12px;border-top:1px solid #ffffff08}
+.task-detail-error{margin:9px 0 0;color:#e0a0a0;font-size:9px;line-height:1.6}
+.task-detail-result{margin:9px 0 0;color:#c9d0d6;font-size:10px;line-height:1.65}
+.task-detail-muted{margin:9px 0 0;color:#737c87;font-size:8px}
+.task-observations{display:flex;flex-direction:column;gap:6px;margin:10px 0 0;padding:0;list-style:none}
+.task-observations li{display:flex;align-items:center;gap:8px;padding:7px 9px;border:1px solid #ffffff0d;border-radius:5px;background:#0d0f13;color:#8d959f;font-size:8px}
+.task-observations li b{flex:none;color:#a7d9b1;font:8px var(--mono);font-weight:500}
+.task-observations li span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.task-observations li i{flex:none;font:7px var(--mono);font-style:normal;letter-spacing:.04em}
+.task-observations li i.ok{color:#9be5ac}
+.task-observations li i.fail{color:#e58e8e}
+.command-feedback{position:absolute;left:50%;bottom:104px;transform:translateX(-50%);max-width:min(680px,86vw);display:flex;align-items:center;gap:9px;padding:9px 12px;border:1px solid #9be5ac2e;border-radius:7px;background:#101511ee;box-shadow:0 14px 34px #0006;color:#d6dbe0;font-size:11px;line-height:1.5;z-index:12}
+.command-feedback-text{flex:1;min-width:0}
+.feedback-spark{display:grid;place-items:center;flex:none;color:#9be5ac}
+.command-resume{flex:none;height:26px;padding:0 10px;border:1px solid #9be5ac3d;border-radius:5px;background:#9be5ac0f;color:#a8e6b5;font:8px var(--display);cursor:pointer}
+.command-resume:hover:not(:disabled){background:#9be5ac1c;border-color:#9be5ac66}
+.command-resume:disabled{opacity:.5;cursor:not-allowed}
+.chat-task-paused{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px;padding:9px 11px;border:1px solid #c5ac7733;border-radius:7px;background:#c5ac7708;color:#c9b98f;font-size:9px;line-height:1.5}
+.chat-task-paused>span{flex:1;min-width:180px}
+.chat-task-stream{width:100%;color:#9aa39c;font-size:8px;line-height:1.6;white-space:pre-wrap}
+.chat-task-paused .product-secondary{height:27px;font-size:8px}
+@media(max-width:760px){.command-feedback{bottom:96px;max-width:92vw}.task-history-main{flex-wrap:wrap}.task-progress{width:100%}.task-history-copy small{white-space:normal}}
+
+/* Shared async indicator used by task resume/cancel/run controls. */
+.tiny-spinner{width:9px;height:9px;display:inline-block;flex:none;border:1px solid #9be5ac;border-top-color:transparent;border-radius:50%;animation:chat-spin .8s linear infinite}
+.chat-task-paused .product-secondary{display:inline-flex;align-items:center;gap:6px}
+.task-resume .tiny-spinner,.command-resume .tiny-spinner,.task-composer .tiny-spinner{border-color:#9be5ac;border-top-color:transparent}
+@media(max-width:760px){.chat-task-paused{gap:7px}.task-history-actions{flex-wrap:wrap}}

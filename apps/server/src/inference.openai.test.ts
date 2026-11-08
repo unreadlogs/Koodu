@@ -56,6 +56,27 @@ describe('parseModelOutput', () => {
     expect(result.reply).toBe(long);
   });
 
+  it('does not clip a long reply at the old 4k/8k limits', () => {
+    const long = 'y'.repeat(20_000);
+    const result = parseModelOutput(JSON.stringify({ action: null, args: {}, confidence: 0.9, reply: long }), { id: 'cloud', kind: 'cloud' });
+    expect(result.reply).toBe(long);
+  });
+
+  it('recovers the clean reply from truncated JSON instead of leaking raw JSON', () => {
+    // The model hit its output limit mid-string: the reply field is incomplete.
+    const truncated = '{"action":null,"args":{},"confidence":98,"reply":"Hello! I’m Koodu, your local-first agent organizer. Here’s what I can do:\\n\\n• Memory – search your saved long-term memories (search_memory) and store new durable facts';
+    const result = parseModelOutput(truncated, { id: 'cloud', kind: 'cloud' });
+    expect(result.proposal).toBeNull();
+    expect(result.reply ?? '').toContain('Hello! I’m Koodu');
+    expect(result.reply ?? '').not.toContain('"action"');
+  });
+
+  it('returns a null reply when truncation cut before the reply field', () => {
+    const result = parseModelOutput('{"action":null,"args":{},"confidence":98,"rep', { id: 'cloud', kind: 'cloud' });
+    expect(result.proposal).toBeNull();
+    expect(result.reply).toBeNull();
+  });
+
   it('drops cloud-only actions proposed by the local model', () => {
     const result = parseModelOutput(
       '{"action":"spawn_subagent","args":{"agentType":"coding","task":"x"},"confidence":1}',

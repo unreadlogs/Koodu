@@ -1,7 +1,7 @@
 import { timingSafeEqual, randomBytes, randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, watch, writeFileSync, type FSWatcher } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { basename, dirname, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -16,6 +16,8 @@ import Database from 'better-sqlite3';
 import { initializeDatabase } from './storage/database';
 import { MainAgent } from './agent/main-agent';
 import { AgentEngine } from './agent/agent-engine';
+import { createDefaultToolRegistry } from './agent/tools';
+import { SkillsEngine } from './skills';
 import { sanitizeEmbeddingText } from './inference/embedding';
 
 /** Bound both the byte size and the shape of untrusted request bodies. */
@@ -43,17 +45,13 @@ const managedModelSchema = z.object({
   clearApiKey: z.boolean().optional(),
 });
 type ManagedModel = Omit<z.infer<typeof managedModelSchema>, 'apiKey'> & { apiKey: string | null };
-const starterSkills = [
-  { id: 'starter-research-brief', name: 'Research brief', description: 'Turn a question into a concise, sourced research outline.', category: 'Research', instructions: 'Clarify the question and scope. Gather evidence from reliable sources. Separate verified facts from interpretation, cite sources, and finish with a short summary and open questions.', enabled: true, source: 'Koodu starter' },
-  { id: 'starter-code-review', name: 'Code review', description: 'Review a change for correctness, risk, and maintainability.', category: 'Development', instructions: 'Inspect the changed code and its surrounding context. Prioritize concrete bugs and regressions, include file and line references, explain impact, and avoid speculative style feedback.', enabled: true, source: 'Koodu starter' },
-  { id: 'starter-task-plan', name: 'Task planner', description: 'Break a larger request into clear, verifiable steps.', category: 'Organization', instructions: 'Restate the desired outcome, identify dependencies, split the work into small ordered steps, call out unresolved decisions, and define how completion can be verified.', enabled: true, source: 'Koodu starter' },
-] as const;
 
 export interface ServerDeps {
   local?: InferenceRuntime;
   cloud?: InferenceRuntime;
   database?: Database.Database;
   logFilePath?: string;
+  workspaceDir?: string;
 }
 
 type ServerLogEntry = { id: string; at: number; level: 'info' | 'success' | 'warning' | 'error'; source: string; message: string; detail: string | null };
@@ -63,9 +61,23 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
   const ownsDatabase = !deps.database;
   const database = deps.database ?? initializeDatabase(':memory:');
   const mainAgent = new MainAgent({ database });
-  const agentEngine = new AgentEngine(database, mainAgent);
+  const skills = new SkillsEngine(database);
+  skills.seedStarter();
+  const workspaceRoot = deps.workspaceDir
+    ?? (isAbsolute(config.workspaceDir) ? config.workspaceDir : resolve(process.cwd(), config.workspaceDir));
+  mkdirSync(workspaceRoot, { recursive: true });
+  const toolRegistry = createDefaultToolRegistry();
+  const agentEngine = new AgentEngine({
+    database,
+    memory: mainAgent,
+    skills,
+    tools: toolRegistry,
+    workspaceRoot,
+  });
   const managedModels = new Map<string, ManagedModel>();
   const managedModelUsage = new Map<string, { month: string; tokens: number }>();
+  /** In-flight agent runs, so `tasks.cancel` can actually abort the provider call. */
+  const taskControllers = new Map<string, AbortController>();
   const storedProfiles = database.prepare('SELECT * FROM model_profiles').all() as Array<Record<string, any>>;
   for (const row of storedProfiles) managedModels.set(row.id, { id: row.id, name: row.name, provider: row.provider, model: row.model, baseUrl: row.base_url, role: row.role, maxOutputTokens: row.max_output_tokens, monthlyTokenLimit: row.monthly_token_limit, enabled: Boolean(row.enabled), active: Boolean(row.active), apiKey: row.api_key });
   const storedUsage = database.prepare('SELECT model_id, month, tokens FROM model_usage').all() as Array<{model_id:string;month:string;tokens:number}>;
@@ -75,11 +87,6 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
     VALUES (@id,@name,@provider,@model,@baseUrl,@role,@maxOutputTokens,@monthlyTokenLimit,@enabled,@active,@apiKey,CURRENT_TIMESTAMP)
     ON CONFLICT(id) DO UPDATE SET name=excluded.name,provider=excluded.provider,model=excluded.model,base_url=excluded.base_url,role=excluded.role,max_output_tokens=excluded.max_output_tokens,monthly_token_limit=excluded.monthly_token_limit,enabled=excluded.enabled,active=excluded.active,api_key=excluded.api_key,updated_at=CURRENT_TIMESTAMP`);
   const saveProfile = (profile: ManagedModel) => persistModel.run({ ...profile, enabled: Number(profile.enabled), active: Number(profile.active) });
-  const upsertSkill = database.prepare(`INSERT INTO skills (id,name,description,category,instructions,enabled,source,updated_at)
-    VALUES (@id,@name,@description,@category,@instructions,@enabled,@source,@updatedAt)
-    ON CONFLICT(id) DO UPDATE SET name=excluded.name,description=excluded.description,category=excluded.category,instructions=excluded.instructions,enabled=excluded.enabled,source=excluded.source,updated_at=excluded.updated_at`);
-  const writeSkill = (skill: {id:string;name:string;description:string;category:string;instructions:string;enabled:boolean;source:string}) => upsertSkill.run({...skill,enabled:Number(skill.enabled),updatedAt:Date.now()});
-  const readSkills = () => (database.prepare('SELECT id,name,description,category,instructions,enabled,source,updated_at AS updatedAt FROM skills ORDER BY updated_at DESC,name COLLATE NOCASE').all() as Array<Record<string, any>>).map((skill) => ({...skill,enabled:Boolean(skill.enabled),updatedAt:Number(skill.updatedAt)}));
   // Server-authoritative settings: SQLite app_settings, versioned JSON.
   // The browser cache is never read or migrated into this table.
   const readSettings = (): SettingsSnapshot => {
@@ -185,6 +192,38 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
 
   const local = deps.local ?? createLocalRuntime(config);
   const cloud = deps.cloud ?? createCloudRuntime(config);
+
+  /** Resolve the active managed profile for a route, or fall back to env runtime. */
+  const selectRuntime = (role: 'local' | 'cloud'): { runtime: InferenceRuntime; managed: ManagedModel | null; blocked: 'monthly_token_limit_reached' | null } => {
+    const base = role === 'local' ? local : cloud;
+    const managed = [...managedModels.values()].find((item) => item.enabled && item.active && item.role === base.kind) ?? null;
+    const runtime = managed
+      ? createOpenAiRuntime({
+          id: managed.id,
+          kind: base.kind,
+          baseUrl: managed.baseUrl,
+          model: managed.model,
+          apiKey: managed.apiKey,
+          timeoutMs: Math.max(config.timeoutMs, 30_000),
+          maxOutputTokens: managed.maxOutputTokens,
+        })
+      : base;
+    if (managed && managed.monthlyTokenLimit > 0) {
+      const month = new Date().toISOString().slice(0, 7);
+      const usage = managedModelUsage.get(managed.id);
+      if (usage?.month === month && usage.tokens >= managed.monthlyTokenLimit) {
+        return { runtime, managed, blocked: 'monthly_token_limit_reached' };
+      }
+    }
+    return { runtime, managed, blocked: null };
+  };
+
+  const recordModelUsage = (managed: ManagedModel | null, totalTokens?: number): void => {
+    if (!managed || !totalTokens) return;
+    const month = new Date().toISOString().slice(0, 7);
+    const previous = managedModelUsage.get(managed.id);
+    managedModelUsage.set(managed.id, { month, tokens: (previous?.month === month ? previous.tokens : 0) + totalTokens });
+  };
 
   const authTokens = new Set<string>();
   const authRequired = () => config.auth.password !== null;
@@ -453,6 +492,9 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
           conversation_not_found: 'That conversation no longer exists.',
           agent_failed: 'The companion could not complete the request.',
           monthly_token_limit_reached: 'Monthly token limit reached for this model profile.',
+          task_not_found: 'That agent task no longer exists.',
+          task_not_resumable: 'That agent task is not paused, so it cannot be resumed.',
+          cancelled: 'The request was cancelled.',
         };
         const fail = (code: string, message?: string, details?: unknown) => reply({ type: 'response', id, ok: false, error: message ?? defaultErrorMessages[code] ?? 'The request could not be completed.', error_code: code, ...(details === undefined ? {} : { details }) });
         const requireAuth = () => { if (authenticated) return true; fail('unauthorized'); return false; };
@@ -569,60 +611,40 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
             }
             case 'skills.list': {
               if (!requireAuth()) return;
-              const seeded = database.prepare("SELECT 1 FROM app_settings WHERE key = 'skills.starter-seeded.v1'").get();
-              if (!seeded) {
-                const seed = database.transaction(() => {
-                  for (const skill of starterSkills) {
-                    database.prepare(`INSERT OR IGNORE INTO skills (id,name,description,category,instructions,enabled,source,updated_at) VALUES (?,?,?,?,?,?,?,?)`)
-                      .run(skill.id,skill.name,skill.description,skill.category,skill.instructions,Number(skill.enabled),skill.source,Date.now());
-                  }
-                  database.prepare("INSERT INTO app_settings (key,value_json) VALUES ('skills.starter-seeded.v1','true')").run();
-                });
-                seed();
-              }
-              ok({ skills: readSkills(), persistence: 'sqlite' }); return;
+              ok({ skills: skills.list(), persistence: 'sqlite' }); return;
             }
             case 'skills.save': {
               if (!requireAuth()) return;
-              const skill = parsed.data as {id:string;name:string;description:string;category:string;instructions:string;enabled:boolean;source:string};
+              const skill = parsed.data as {id:string;name:string;description:string;category:'Research'|'Development'|'Organization'|'Custom';instructions:string;enabled:boolean;source:string};
               const existed = database.prepare('SELECT 1 FROM skills WHERE id = ?').get(skill.id);
-              writeSkill(skill);
+              const list = skills.save(skill);
               recordServerLog('success', 'skills', `Skill “${skill.name}” was ${existed ? 'updated' : 'created'}.`, `Category: ${skill.category} · ${skill.enabled ? 'Enabled' : 'Disabled'}.`);
-              ok({ skills: readSkills() }); return;
+              ok({ skills: list }); return;
             }
             case 'skills.delete': {
               if (!requireAuth()) return;
               const id = (parsed.data as {id:string}).id;
               const skill = database.prepare('SELECT name FROM skills WHERE id = ?').get(id) as {name:string}|undefined;
-              database.prepare('DELETE FROM skills WHERE id = ?').run(id);
+              const list = skills.remove(id);
               if (skill) recordServerLog('warning', 'skills', `Skill “${skill.name}” was deleted.`);
-              ok({ skills: readSkills() }); return;
+              ok({ skills: list }); return;
             }
             case 'skills.import': {
               if (!requireAuth()) return;
-              const incoming = (parsed.data as {skills:Array<{id:string;name:string;description:string;category:string;instructions:string;enabled:boolean;source:string}>}).skills;
-              const importSkills = database.transaction(() => { for (const skill of incoming) writeSkill(skill); });
-              importSkills();
+              const incoming = (parsed.data as {skills:Array<{id:string;name:string;description:string;category:'Research'|'Development'|'Organization'|'Custom';instructions:string;enabled:boolean;source:string}>}).skills;
+              const list = skills.importMany(incoming);
               recordServerLog('success', 'skills', `${incoming.length} skill${incoming.length === 1 ? '' : 's'} were imported.`, 'Skill definitions were added to the server library.');
-              ok({ skills: readSkills(), imported: incoming.length }); return;
+              ok({ skills: list, imported: incoming.length }); return;
             }
             case 'intelligence.complete': {
               if (!requireAuth()) return;
               const payload = parsed.data as { role: 'local' | 'cloud'; text: string; context: Record<string, unknown> };
-              const runtime = payload.role === 'local' ? local : cloud;
-              const managed = [...managedModels.values()].find((item) => item.enabled && item.active && item.role === runtime.kind);
-              const selectedRuntime = managed ? createOpenAiRuntime({ id: managed.id, kind: runtime.kind, baseUrl: managed.baseUrl, model: managed.model, apiKey: managed.apiKey, timeoutMs: Math.max(config.timeoutMs, 30000), maxOutputTokens: managed.maxOutputTokens }) : runtime;
-              if (managed && managed.monthlyTokenLimit > 0) {
-                const month = new Date().toISOString().slice(0, 7); const usage = managedModelUsage.get(managed.id);
-                if (usage?.month === month && usage.tokens >= managed.monthlyTokenLimit) { fail('monthly_token_limit_reached', undefined, { provider: managed.id }); return; }
-              }
+              const { runtime: selectedRuntime, managed, blocked } = selectRuntime(payload.role);
+              if (blocked) { fail(blocked, undefined, { provider: managed?.id }); return; }
               if (!selectedRuntime.configured()) { fail('not_configured', undefined, { provider: selectedRuntime.id }); return; }
               try {
                 const result = await selectedRuntime.complete({ text: payload.text, context: payload.context });
-                if (managed && result.usage?.totalTokens) {
-                  const month = new Date().toISOString().slice(0, 7); const previous = managedModelUsage.get(managed.id);
-                  managedModelUsage.set(managed.id, { month, tokens: (previous?.month === month ? previous.tokens : 0) + result.usage.totalTokens });
-                }
+                recordModelUsage(managed, result.usage?.totalTokens);
                 recordServerLog('success', 'inference', `${payload.role === 'cloud' ? 'Cloud' : 'Local'} inference completed.`, `Provider: ${selectedRuntime.id}.`);
                 ok(result);
               } catch (error) {
@@ -669,48 +691,46 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
                 database.prepare('UPDATE chat_conversations SET title=?,updated_at=? WHERE id=?').run(title, now, conversation.id);
               } else database.prepare('UPDATE chat_conversations SET updated_at=? WHERE id=?').run(now, conversation.id);
               const recent = database.prepare(`SELECT role,content FROM chat_messages WHERE conversation_id=? ORDER BY created_at DESC,id DESC LIMIT 20`).all(conversation.id) as Array<{role:'user'|'assistant';content:string}>;
-              const context = { conversation: recent.reverse().map((message) => ({ role: message.role, content: message.content.slice(0, 4_000) })) };
-              const runtime = payload.role === 'local' ? local : cloud;
-              const managed = [...managedModels.values()].find((item) => item.enabled && item.active && item.role === runtime.kind);
-              const selectedRuntime = managed ? createOpenAiRuntime({ id: managed.id, kind: runtime.kind, baseUrl: managed.baseUrl, model: managed.model, apiKey: managed.apiKey, timeoutMs: Math.max(config.timeoutMs, 30000), maxOutputTokens: managed.maxOutputTokens }) : runtime;
-              if (managed && managed.monthlyTokenLimit > 0) {
-                const month = new Date().toISOString().slice(0, 7); const usage = managedModelUsage.get(managed.id);
-                if (usage?.month === month && usage.tokens >= managed.monthlyTokenLimit) { fail('monthly_token_limit_reached', undefined, { provider: managed.id }); return; }
-              }
+              const context = { conversationId: conversation.id, conversation: recent.reverse().map((message) => ({ role: message.role, content: message.content.slice(0, 4_000) })) };
+              const { runtime: selectedRuntime, managed, blocked } = selectRuntime(payload.role);
+              if (blocked) { fail(blocked, undefined, { provider: managed?.id }); return; }
               if (!selectedRuntime.configured()) { fail('not_configured', undefined, { provider: selectedRuntime.id }); return; }
               const controller = new AbortController(); const abortOnClose = () => controller.abort(); ws.once('close', abortOnClose);
+              const taskId = randomUUID();
+              taskControllers.set(taskId, controller);
               try {
-                const result = await agentEngine.run({ text: payload.text, context, runtime: selectedRuntime, signal: controller.signal,
+                const result = await agentEngine.run({ taskId, text: payload.text, context, runtime: selectedRuntime, signal: controller.signal,
                   onTextDelta: (text) => reply({ type: 'event', event: 'agent.stream', requestId: id, payload: { kind: 'delta', text } }),
                   onTextReset: () => reply({ type: 'event', event: 'agent.stream', requestId: id, payload: { kind: 'reset' } }),
                 });
                 const createdAt = new Date().toISOString();
                 database.prepare('INSERT INTO chat_messages (id,conversation_id,role,content,created_at) VALUES (?,?,\'assistant\',?,?)').run(randomUUID(), conversation.id, result.reply, createdAt);
                 database.prepare('UPDATE chat_conversations SET updated_at=? WHERE id=?').run(createdAt, conversation.id);
+                if (result.status === 'paused') {
+                  recordServerLog('warning', 'chats', 'A chat task paused at its safe step limit.', `Task: ${result.taskId}. Steps: ${result.iterations}. Tools: ${result.toolCalls}.`);
+                }
                 ok({ ...result, conversationId: conversation.id, createdAt });
               } catch (error) {
                 const code = error instanceof InferenceError ? error.code : controller.signal.aborted ? 'cancelled' : 'agent_failed';
                 recordServerLog(controller.signal.aborted ? 'warning' : 'error', 'chats', controller.signal.aborted ? 'A chat request was cancelled.' : 'A chat request failed.', `Error code: ${code} · Provider: ${selectedRuntime.id} · ${error instanceof Error ? error.message.slice(0, 200) : 'unknown'}`);
                 fail(code, undefined, { provider: selectedRuntime.id, detail: error instanceof Error ? error.message.slice(0, 300) : undefined });
-              } finally { ws.removeListener('close', abortOnClose); }
+              } finally { ws.removeListener('close', abortOnClose); taskControllers.delete(taskId); }
               return;
             }
             case 'agent.run': {
               if (!requireAuth()) return;
               const payload = parsed.data as { role: 'local' | 'cloud'; agentType?: 'research' | 'coding' | 'organizer' | 'memory'; text: string; context: Record<string, unknown> };
-              const runtime = payload.role === 'local' ? local : cloud;
-              const managed = [...managedModels.values()].find((item) => item.enabled && item.active && item.role === runtime.kind);
-              const selectedRuntime = managed ? createOpenAiRuntime({ id: managed.id, kind: runtime.kind, baseUrl: managed.baseUrl, model: managed.model, apiKey: managed.apiKey, timeoutMs: Math.max(config.timeoutMs, 30000), maxOutputTokens: managed.maxOutputTokens }) : runtime;
-              if (managed && managed.monthlyTokenLimit > 0) {
-                const month = new Date().toISOString().slice(0, 7); const usage = managedModelUsage.get(managed.id);
-                if (usage?.month === month && usage.tokens >= managed.monthlyTokenLimit) { fail('monthly_token_limit_reached', undefined, { provider: managed.id }); return; }
-              }
+              const { runtime: selectedRuntime, managed, blocked } = selectRuntime(payload.role);
+              if (blocked) { fail(blocked, undefined, { provider: managed?.id }); return; }
               if (!selectedRuntime.configured()) { fail('not_configured', undefined, { provider: selectedRuntime.id }); return; }
               const controller = new AbortController();
               const abortOnClose = () => controller.abort();
               ws.once('close', abortOnClose);
+              const taskId = randomUUID();
+              taskControllers.set(taskId, controller);
               try {
                 const result = await agentEngine.run({
+                  taskId,
                   text: payload.text,
                   context: payload.context,
                   runtime: selectedRuntime,
@@ -719,7 +739,7 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
                   onTextDelta: (text) => reply({ type: 'event', event: 'agent.stream', requestId: id, payload: { kind: 'delta', text } }),
                   onTextReset: () => reply({ type: 'event', event: 'agent.stream', requestId: id, payload: { kind: 'reset' } }),
                 });
-                recordServerLog('success', 'agent', 'The companion completed a request.', `Task: ${result.taskId}. Steps: ${result.iterations}. Tools: ${result.toolCalls}.`);
+                recordServerLog(result.status === 'paused' ? 'warning' : 'success', 'agent', result.status === 'paused' ? 'The companion paused a task at its safe step limit.' : 'The companion completed a request.', `Task: ${result.taskId}. Steps: ${result.iterations}. Tools: ${result.toolCalls}.`);
                 ok(result);
               } catch (error) {
                 const code = error instanceof InferenceError ? error.code : controller.signal.aborted ? 'cancelled' : 'agent_failed';
@@ -727,8 +747,83 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
                 fail(code, undefined, { provider: selectedRuntime.id, detail: error instanceof Error ? error.message.slice(0, 300) : undefined });
               } finally {
                 ws.removeListener('close', abortOnClose);
+                taskControllers.delete(taskId);
               }
               return;
+            }
+            case 'agent.resume': {
+              if (!requireAuth()) return;
+              const payload = parsed.data as { taskId: string; role: 'local' | 'cloud' };
+              const task = agentEngine.getTask(payload.taskId);
+              if (!task) { fail('task_not_found', undefined, { taskId: payload.taskId }); return; }
+              if ((task.status !== 'paused' && task.status !== 'failed') || !task.checkpoint) { fail('task_not_resumable', undefined, { taskId: payload.taskId, status: task.status }); return; }
+              const { runtime: selectedRuntime, managed, blocked } = selectRuntime(payload.role);
+              if (blocked) { fail(blocked, undefined, { provider: managed?.id }); return; }
+              if (!selectedRuntime.configured()) { fail('not_configured', undefined, { provider: selectedRuntime.id }); return; }
+              const controller = new AbortController();
+              const abortOnClose = () => controller.abort();
+              ws.once('close', abortOnClose);
+              taskControllers.set(payload.taskId, controller);
+              try {
+                const result = await agentEngine.resume(payload.taskId, {
+                  text: task.task,
+                  context: task.checkpoint.context,
+                  runtime: selectedRuntime,
+                  agentType: task.agentType,
+                  signal: controller.signal,
+                  onTextDelta: (text) => reply({ type: 'event', event: 'agent.stream', requestId: id, payload: { kind: 'delta', text } }),
+                  onTextReset: () => reply({ type: 'event', event: 'agent.stream', requestId: id, payload: { kind: 'reset' } }),
+                }, task.checkpoint.agentType);
+                // A chat task remembers its conversation, so a resumed reply lands in the same thread.
+                const conversationId = task.checkpoint.context.conversationId;
+                if (typeof conversationId === 'string' && result.reply.trim()) {
+                  const conversation = database.prepare('SELECT id FROM chat_conversations WHERE id=?').get(conversationId) as { id: string } | undefined;
+                  if (conversation) {
+                    const createdAt = new Date().toISOString();
+                    database.prepare('INSERT INTO chat_messages (id,conversation_id,role,content,created_at) VALUES (?,?,\'assistant\',?,?)').run(randomUUID(), conversationId, result.reply, createdAt);
+                    database.prepare('UPDATE chat_conversations SET updated_at=? WHERE id=?').run(createdAt, conversationId);
+                  }
+                }
+                recordServerLog(result.status === 'paused' ? 'warning' : 'success', 'agent', result.status === 'paused' ? 'A resumed task paused again at its safe step limit.' : 'A resumed task completed.', `Task: ${result.taskId}. Steps: ${result.iterations}. Tools: ${result.toolCalls}.`);
+                ok(result);
+              } catch (error) {
+                const code = error instanceof InferenceError ? error.code : controller.signal.aborted ? 'cancelled' : 'agent_failed';
+                recordServerLog(controller.signal.aborted ? 'warning' : 'error', 'agent', controller.signal.aborted ? 'A resumed task was cancelled.' : 'A resumed task could not complete.', `Error code: ${code} · Provider: ${selectedRuntime.id} · ${error instanceof Error ? error.message.slice(0, 200) : 'unknown'}`);
+                fail(code, undefined, { provider: selectedRuntime.id, detail: error instanceof Error ? error.message.slice(0, 300) : undefined });
+              } finally {
+                ws.removeListener('close', abortOnClose);
+                taskControllers.delete(payload.taskId);
+              }
+              return;
+            }
+            case 'tasks.list': {
+              if (!requireAuth()) return;
+              const { limit } = parsed.data as { limit?: number };
+              ok({ tasks: agentEngine.listTasks(limit) }); return;
+            }
+            case 'tasks.get': {
+              if (!requireAuth()) return;
+              const { taskId } = parsed.data as { taskId: string };
+              const task = agentEngine.getTask(taskId);
+              if (!task) { fail('task_not_found', undefined, { taskId }); return; }
+              ok({ task }); return;
+            }
+            case 'tasks.events': {
+              if (!requireAuth()) return;
+              const { taskId, limit } = parsed.data as { taskId: string; limit?: number };
+              const task = agentEngine.getTask(taskId);
+              if (!task) { fail('task_not_found', undefined, { taskId }); return; }
+              ok({ task, events: agentEngine.taskEvents(taskId, limit) }); return;
+            }
+            case 'tasks.cancel': {
+              if (!requireAuth()) return;
+              const { taskId } = parsed.data as { taskId: string };
+              const task = agentEngine.getTask(taskId);
+              if (!task) { fail('task_not_found', undefined, { taskId }); return; }
+              taskControllers.get(taskId)?.abort();
+              agentEngine.cancelTask(taskId);
+              recordServerLog('warning', 'agent', 'An agent task was cancelled.', `Task: ${taskId}.`);
+              ok({ ok: true, task: agentEngine.getTask(taskId) }); return;
             }
             case 'settings.get': {
               if (!requireAuth()) return;
