@@ -38,13 +38,22 @@ describe('parseModelOutput', () => {
     expect(result.reply).toBe('Not sure.');
   });
 
-  it('rejects unknown actions and malformed json', () => {
-    expect(() =>
-      parseModelOutput('{"action":"format_disk","args":{}}', { id: 'local-model', kind: 'local' }),
-    ).toThrow(/bad_shape/);
-    expect(() =>
-      parseModelOutput('not json at all', { id: 'local-model', kind: 'local' }),
-    ).toThrow(/not_json/);
+  it('tolerates unknown actions and falls back to plain text for non-JSON', () => {
+    // Unknown actions are coerced to no proposal (never executed), keeping the reply.
+    const unknown = parseModelOutput('{"action":"format_disk","args":{}}', { id: 'local-model', kind: 'local' });
+    expect(unknown.proposal).toBeNull();
+    const inventedReply = parseModelOutput('{"action":"reply","args":{},"confidence":0.99,"reply":"Hello! How can I help you today?"}', { id: 'cloud', kind: 'cloud' });
+    expect(inventedReply.proposal).toBeNull();
+    expect(inventedReply.reply).toBe('Hello! How can I help you today?');
+    const plain = parseModelOutput('not json at all', { id: 'local-model', kind: 'local' });
+    expect(plain.proposal).toBeNull();
+    expect(plain.reply).toBe('not json at all');
+  });
+
+  it('keeps long chat replies instead of rejecting them', () => {
+    const long = 'x'.repeat(800);
+    const result = parseModelOutput(JSON.stringify({ action: null, args: {}, confidence: 0.9, reply: long }), { id: 'cloud', kind: 'cloud' });
+    expect(result.reply).toBe(long);
   });
 
   it('drops cloud-only actions proposed by the local model', () => {

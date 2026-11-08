@@ -1,11 +1,11 @@
 import { z } from 'zod';
 import { loginRequestSchema } from './auth';
+import { workspaceSettingsSchema } from './settings';
 
 /** JSON request/response contract used by the single application WebSocket. */
 export const rpcMethods = [
   'system.health',
   'system.ping',
-  'companion.manifest',
   'auth.status',
   'auth.login',
   'auth.authenticate',
@@ -32,6 +32,9 @@ export const rpcMethods = [
   'chats.delete',
   'chats.messages',
   'chats.send',
+  'settings.get',
+  'settings.save',
+  'settings.reset',
 ] as const;
 export const rpcMethodSchema = z.enum(rpcMethods);
 export type RpcMethod = (typeof rpcMethods)[number];
@@ -63,7 +66,7 @@ const skillSchema = z.object({
 export const rpcPayloadSchemas = {
   'system.health': z.object({}),
   'system.ping': z.object({ at: z.number().int() }),
-  'companion.manifest': z.object({ character: z.enum(['kumo', 'kitsu']) }),
+
   'auth.status': z.object({}),
   'auth.login': loginRequestSchema,
   'auth.authenticate': z.object({ token: z.string().min(1).max(256) }),
@@ -95,6 +98,9 @@ export const rpcPayloadSchemas = {
   'chats.delete': z.object({ conversationId: z.string().uuid() }),
   'chats.messages': z.object({ conversationId: z.string().uuid() }),
   'chats.send': z.object({ conversationId: z.string().uuid(), role: z.enum(['local', 'cloud']), text: z.string().trim().min(1).max(1_000) }),
+  'settings.get': z.object({}),
+  'settings.save': workspaceSettingsSchema,
+  'settings.reset': z.object({}),
 } satisfies Record<RpcMethod, z.ZodTypeAny>;
 
 export type RpcPayload<K extends RpcMethod> = z.infer<(typeof rpcPayloadSchemas)[K]>;

@@ -8,6 +8,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyStatic from '@fastify/static';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import { AUTH_HEADER, loginRequestSchema, rpcPayloadSchemas, rpcRequestSchema } from '@koodu/protocol';
+import { defaultWorkspaceSettings, workspaceSettingsKey, workspaceSettingsSchema, type SettingsSnapshot } from '@koodu/protocol';
 import type { ServerConfig } from './config';
 import { createOpenAiRuntime } from './inference/openai';
 import { InferenceError, type InferenceRuntime } from './inference/types';
@@ -79,6 +80,24 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
     ON CONFLICT(id) DO UPDATE SET name=excluded.name,description=excluded.description,category=excluded.category,instructions=excluded.instructions,enabled=excluded.enabled,source=excluded.source,updated_at=excluded.updated_at`);
   const writeSkill = (skill: {id:string;name:string;description:string;category:string;instructions:string;enabled:boolean;source:string}) => upsertSkill.run({...skill,enabled:Number(skill.enabled),updatedAt:Date.now()});
   const readSkills = () => (database.prepare('SELECT id,name,description,category,instructions,enabled,source,updated_at AS updatedAt FROM skills ORDER BY updated_at DESC,name COLLATE NOCASE').all() as Array<Record<string, any>>).map((skill) => ({...skill,enabled:Boolean(skill.enabled),updatedAt:Number(skill.updatedAt)}));
+  // Server-authoritative settings: SQLite app_settings, versioned JSON.
+  // The browser cache is never read or migrated into this table.
+  const readSettings = (): SettingsSnapshot => {
+    const row = database.prepare('SELECT value_json, updated_at FROM app_settings WHERE key = ?').get(workspaceSettingsKey) as { value_json: string; updated_at?: string | null } | undefined;
+    if (!row) return { settings: defaultWorkspaceSettings, updatedAt: null, persistence: 'sqlite' as const };
+    try {
+      const parsed = workspaceSettingsSchema.safeParse(JSON.parse(String(row.value_json)));
+      if (!parsed.success) return { settings: defaultWorkspaceSettings, updatedAt: typeof row.updated_at === 'string' ? row.updated_at : null, persistence: 'sqlite' as const };
+      return { settings: parsed.data, updatedAt: typeof row.updated_at === 'string' ? row.updated_at : null, persistence: 'sqlite' as const };
+    } catch {
+      return { settings: defaultWorkspaceSettings, updatedAt: typeof row.updated_at === 'string' ? row.updated_at : null, persistence: 'sqlite' as const };
+    }
+  };
+  const writeSettings = (settings: typeof defaultWorkspaceSettings): SettingsSnapshot => {
+    database.prepare(`INSERT INTO app_settings (key, value_json, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = CURRENT_TIMESTAMP`).run(workspaceSettingsKey, JSON.stringify(settings));
+    return readSettings();
+  };
   const logFilePath = deps.logFilePath ?? (config.databasePath === ':memory:' ? null : resolve(dirname(config.databasePath), 'koodu.log.jsonl'));
   const logSubscribers = new Set<WebSocket>();
   const logCache: ServerLogEntry[] = [];
@@ -396,14 +415,12 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
   wss.on('connection', (ws: WebSocket) => {
     let authenticated = !authRequired();
     let connectionToken: string | null = null;
-    let chain = Promise.resolve();
     const reply = (obj: unknown) => {
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
     };
     reply({ type: 'hello', protocol: 1, at: Date.now(), authRequired: authRequired() });
 
     ws.on('message', (data: RawData) => {
-      chain = chain.then(() => {
         void (async () => {
         const raw = data instanceof ArrayBuffer ? Buffer.from(data) : Array.isArray(data) ? Buffer.concat(data) : data;
         if (raw.byteLength > 1_048_576) return;
@@ -428,23 +445,20 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
           internal_error: 'The server could not complete the request.',
           invalid_request: 'The request payload is invalid.',
           invalid_memory: 'The memory text is empty after applying the safe length limit.',
-          not_configured: 'The requested model provider is not configured.',
-          timeout: 'The request timed out. Please try again.',
-          unavailable: 'The requested service is currently unavailable.',
+          not_configured: 'The requested model provider is not configured. Add an active profile in Models or set a provider endpoint, then try again.',
+          timeout: 'The AI provider timed out. Please try again.',
+          rate_limited: 'The AI provider is rate-limiting requests. Please wait a moment and try again.',
+          http_error: 'The AI provider returned an error. Please try again in a moment.',
+          invalid_output: 'The AI returned an unexpected format. Please try again.',
+          conversation_not_found: 'That conversation no longer exists.',
+          agent_failed: 'The companion could not complete the request.',
+          monthly_token_limit_reached: 'Monthly token limit reached for this model profile.',
         };
         const fail = (code: string, message?: string, details?: unknown) => reply({ type: 'response', id, ok: false, error: message ?? defaultErrorMessages[code] ?? 'The request could not be completed.', error_code: code, ...(details === undefined ? {} : { details }) });
         const requireAuth = () => { if (authenticated) return true; fail('unauthorized'); return false; };
         try {
           switch (method) {
             case 'system.ping': ok({ serverAt: Date.now(), at: (parsed.data as { at: number }).at }); return;
-            case 'companion.manifest': {
-              const { character } = parsed.data as { character: 'kumo' | 'kitsu' };
-              try {
-                const manifest = await readFile(resolve(publicDir, character, 'animation_manifest.json'), 'utf8');
-                ok(JSON.parse(manifest));
-              } catch { fail('companion_manifest_unavailable'); }
-              return;
-            }
             case 'system.health': ok({ ok: true, service: 'koodu-server', inference: { local: { id: local.id, kind: local.kind, model: local.model, configured: local.configured(), location: 'server' }, cloud: { id: cloud.id, kind: cloud.kind, model: cloud.model, configured: cloud.configured(), location: 'server' } }, ws: { path: '/ws', clients: wss.clients.size } }); return;
             case 'auth.status': ok({ authRequired: authRequired(), authenticated }); return;
             case 'auth.login': {
@@ -597,7 +611,7 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
               const payload = parsed.data as { role: 'local' | 'cloud'; text: string; context: Record<string, unknown> };
               const runtime = payload.role === 'local' ? local : cloud;
               const managed = [...managedModels.values()].find((item) => item.enabled && item.active && item.role === runtime.kind);
-              const selectedRuntime = managed ? createOpenAiRuntime({ id: managed.id, kind: runtime.kind, baseUrl: managed.baseUrl, model: managed.model, apiKey: managed.apiKey, timeoutMs: config.timeoutMs, maxOutputTokens: managed.maxOutputTokens }) : runtime;
+              const selectedRuntime = managed ? createOpenAiRuntime({ id: managed.id, kind: runtime.kind, baseUrl: managed.baseUrl, model: managed.model, apiKey: managed.apiKey, timeoutMs: Math.max(config.timeoutMs, 30000), maxOutputTokens: managed.maxOutputTokens }) : runtime;
               if (managed && managed.monthlyTokenLimit > 0) {
                 const month = new Date().toISOString().slice(0, 7); const usage = managedModelUsage.get(managed.id);
                 if (usage?.month === month && usage.tokens >= managed.monthlyTokenLimit) { fail('monthly_token_limit_reached', undefined, { provider: managed.id }); return; }
@@ -658,7 +672,7 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
               const context = { conversation: recent.reverse().map((message) => ({ role: message.role, content: message.content.slice(0, 4_000) })) };
               const runtime = payload.role === 'local' ? local : cloud;
               const managed = [...managedModels.values()].find((item) => item.enabled && item.active && item.role === runtime.kind);
-              const selectedRuntime = managed ? createOpenAiRuntime({ id: managed.id, kind: runtime.kind, baseUrl: managed.baseUrl, model: managed.model, apiKey: managed.apiKey, timeoutMs: config.timeoutMs, maxOutputTokens: managed.maxOutputTokens }) : runtime;
+              const selectedRuntime = managed ? createOpenAiRuntime({ id: managed.id, kind: runtime.kind, baseUrl: managed.baseUrl, model: managed.model, apiKey: managed.apiKey, timeoutMs: Math.max(config.timeoutMs, 30000), maxOutputTokens: managed.maxOutputTokens }) : runtime;
               if (managed && managed.monthlyTokenLimit > 0) {
                 const month = new Date().toISOString().slice(0, 7); const usage = managedModelUsage.get(managed.id);
                 if (usage?.month === month && usage.tokens >= managed.monthlyTokenLimit) { fail('monthly_token_limit_reached', undefined, { provider: managed.id }); return; }
@@ -676,7 +690,8 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
                 ok({ ...result, conversationId: conversation.id, createdAt });
               } catch (error) {
                 const code = error instanceof InferenceError ? error.code : controller.signal.aborted ? 'cancelled' : 'agent_failed';
-                fail(code);
+                recordServerLog(controller.signal.aborted ? 'warning' : 'error', 'chats', controller.signal.aborted ? 'A chat request was cancelled.' : 'A chat request failed.', `Error code: ${code} · Provider: ${selectedRuntime.id} · ${error instanceof Error ? error.message.slice(0, 200) : 'unknown'}`);
+                fail(code, undefined, { provider: selectedRuntime.id, detail: error instanceof Error ? error.message.slice(0, 300) : undefined });
               } finally { ws.removeListener('close', abortOnClose); }
               return;
             }
@@ -685,7 +700,7 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
               const payload = parsed.data as { role: 'local' | 'cloud'; agentType?: 'research' | 'coding' | 'organizer' | 'memory'; text: string; context: Record<string, unknown> };
               const runtime = payload.role === 'local' ? local : cloud;
               const managed = [...managedModels.values()].find((item) => item.enabled && item.active && item.role === runtime.kind);
-              const selectedRuntime = managed ? createOpenAiRuntime({ id: managed.id, kind: runtime.kind, baseUrl: managed.baseUrl, model: managed.model, apiKey: managed.apiKey, timeoutMs: config.timeoutMs, maxOutputTokens: managed.maxOutputTokens }) : runtime;
+              const selectedRuntime = managed ? createOpenAiRuntime({ id: managed.id, kind: runtime.kind, baseUrl: managed.baseUrl, model: managed.model, apiKey: managed.apiKey, timeoutMs: Math.max(config.timeoutMs, 30000), maxOutputTokens: managed.maxOutputTokens }) : runtime;
               if (managed && managed.monthlyTokenLimit > 0) {
                 const month = new Date().toISOString().slice(0, 7); const usage = managedModelUsage.get(managed.id);
                 if (usage?.month === month && usage.tokens >= managed.monthlyTokenLimit) { fail('monthly_token_limit_reached', undefined, { provider: managed.id }); return; }
@@ -708,17 +723,32 @@ export function createServer(config: ServerConfig, deps: ServerDeps = {}): Fasti
                 ok(result);
               } catch (error) {
                 const code = error instanceof InferenceError ? error.code : controller.signal.aborted ? 'cancelled' : 'agent_failed';
-                recordServerLog(controller.signal.aborted ? 'warning' : 'error', 'agent', controller.signal.aborted ? 'The companion request was cancelled.' : 'The companion could not complete a request.', `Error code: ${code}.`);
-                fail(code);
+                recordServerLog(controller.signal.aborted ? 'warning' : 'error', 'agent', controller.signal.aborted ? 'The companion request was cancelled.' : 'The companion could not complete a request.', `Error code: ${code} · Provider: ${selectedRuntime.id} · ${error instanceof Error ? error.message.slice(0, 200) : 'unknown'}`);
+                fail(code, undefined, { provider: selectedRuntime.id, detail: error instanceof Error ? error.message.slice(0, 300) : undefined });
               } finally {
                 ws.removeListener('close', abortOnClose);
               }
               return;
             }
+            case 'settings.get': {
+              if (!requireAuth()) return;
+              ok(readSettings()); return;
+            }
+            case 'settings.save': {
+              if (!requireAuth()) return;
+              const snapshot = writeSettings(parsed.data as typeof defaultWorkspaceSettings);
+              recordServerLog('success', 'settings', 'User settings were updated.', `Companion: ${snapshot.settings.character === 'kumo' ? 'Kumo' : 'Kitsu'} · Startup: ${snapshot.settings.startupPage} · Pet mode: ${snapshot.settings.petMode}.`);
+              ok(snapshot); return;
+            }
+            case 'settings.reset': {
+              if (!requireAuth()) return;
+              const snapshot = writeSettings(defaultWorkspaceSettings);
+              recordServerLog('warning', 'settings', 'User settings were reset to defaults.');
+              ok(snapshot); return;
+            }
           }
         } catch { fail('internal_error'); }
         })().catch(() => { /* Keep this socket's dispatcher alive after malformed input. */ });
-      });
     });
 
     ws.on('error', () => {

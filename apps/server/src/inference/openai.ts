@@ -1,4 +1,4 @@
-import { actionNameSchema, isLocalAction, type ActionName } from '@koodu/protocol';
+import { ACTION_NAMES, isLocalAction, type ActionName } from '@koodu/protocol';
 import { z } from 'zod';
 import { buildSystemPrompt, buildUserPrompt } from './prompt';
 import {
@@ -8,24 +8,16 @@ import {
   type InferenceRuntime,
 } from './types';
 
-const modelOutputSchema = z.object({
-  action: actionNameSchema.nullable().default(null),
-  args: z.record(z.unknown()).default({}),
-  confidence: z.number().min(0).max(1).default(0.5),
-  reply: z.string().max(500).nullable().default(null),
-  tool_calls: z.array(z.object({ name: z.string().min(1).max(40), args: z.record(z.unknown()) })).max(4).default([]),
-});
-
 const chatCompletionSchema = z.object({
   choices: z
-    .array(z.object({ message: z.object({ content: z.string() }) }))
+    .array(z.object({ message: z.object({ content: z.string().nullable().optional(), reasoning: z.string().nullable().optional() }).passthrough() }))
     .min(1),
   usage: z.object({ total_tokens: z.number().int().nonnegative().optional() }).optional(),
-});
+}).passthrough();
 const streamedChunkSchema = z.object({
-  choices: z.array(z.object({ delta: z.object({ content: z.string().optional() }).optional() })).default([]),
+  choices: z.array(z.object({ delta: z.object({ content: z.string().nullable().optional(), reasoning: z.string().nullable().optional() }).passthrough().optional() })).default([]),
   usage: z.object({ total_tokens: z.number().int().nonnegative().optional() }).nullable().optional(),
-});
+}).passthrough();
 
 export interface OpenAiRuntimeOptions {
   id: string;
@@ -72,6 +64,7 @@ export function createOpenAiRuntime(options: OpenAiRuntimeOptions): InferenceRun
       signal?.addEventListener('abort', forwardAbort, { once: true });
 
       try {
+        const effectiveMaxTokens = Math.max(options.maxOutputTokens ?? 300, 2048);
         const response = await doFetch(
           `${options.baseUrl.replace(/\/+$/, '')}/chat/completions`,
           {
@@ -83,7 +76,7 @@ export function createOpenAiRuntime(options: OpenAiRuntimeOptions): InferenceRun
             body: JSON.stringify({
               model: options.model,
               temperature: 0,
-              max_tokens: options.maxOutputTokens ?? 300,
+              max_tokens: effectiveMaxTokens,
               response_format: { type: 'json_object' },
               ...(request.onTextDelta ? { stream: true } : {}),
               messages: [
@@ -96,16 +89,20 @@ export function createOpenAiRuntime(options: OpenAiRuntimeOptions): InferenceRun
         );
 
         if (!response.ok) {
+          let detail = '';
+          try { detail = (await response.text()).slice(0, 500).replace(/\s+/g, ' ').trim(); } catch { detail = ''; }
+          const code = response.status === 429 ? 'rate_limited' : 'http_error';
           throw new InferenceError(
-            'http_error',
-            `${options.id}_status_${response.status}`,
+            code as any,
+            `${options.id}_status_${response.status}${detail ? `_${detail.slice(0, 120)}` : ''}`,
           );
         }
 
         if (request.onTextDelta) {
           if (!response.body) throw new InferenceError('invalid_output', `${options.id}_missing_stream`);
           const streamed = await readStreamingCompletion(response.body, request.onTextDelta);
-          return parseModelOutput(streamed.content, options, streamed.totalTokens);
+          const fallback = !streamed.content.trim() && streamed.reasoning && streamed.reasoning.includes('"reply"') && streamed.reasoning.includes('{') ? streamed.reasoning : streamed.content;
+          return parseModelOutput(fallback, options, streamed.totalTokens);
         }
 
         const body: unknown = await response.json();
@@ -114,7 +111,11 @@ export function createOpenAiRuntime(options: OpenAiRuntimeOptions): InferenceRun
           throw new InferenceError('invalid_output', `${options.id}_bad_completion`);
         }
 
-        const content = completion.data.choices[0]?.message.content ?? '';
+        const message = completion.data.choices[0]?.message;
+        let content = typeof message?.content === 'string' ? message.content : '';
+        if (!content.trim() && typeof message?.reasoning === 'string' && message.reasoning.includes('"reply"') && message.reasoning.includes('{')) {
+          content = message.reasoning;
+        }
         return parseModelOutput(content, options, completion.data.usage?.total_tokens);
       } catch (error) {
         if (error instanceof InferenceError) throw error;
@@ -138,11 +139,12 @@ export function createOpenAiRuntime(options: OpenAiRuntimeOptions): InferenceRun
 async function readStreamingCompletion(
   body: ReadableStream<Uint8Array>,
   onTextDelta: (delta: string) => void,
-): Promise<{ content: string; totalTokens?: number }> {
+): Promise<{ content: string; reasoning: string; totalTokens?: number }> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let pending = '';
   let content = '';
+  let reasoning = '';
   let emittedReply = '';
   let totalTokens: number | undefined;
   const consume = (line: string): void => {
@@ -153,9 +155,11 @@ async function readStreamingCompletion(
     try { value = JSON.parse(data); } catch { return; }
     const parsed = streamedChunkSchema.safeParse(value);
     if (!parsed.success) return;
-    const delta = parsed.data.choices[0]?.delta?.content ?? '';
-    if (delta) {
-      content += delta;
+    const delta = parsed.data.choices[0]?.delta;
+    const chunk = typeof delta?.content === 'string' ? delta.content : '';
+    if (typeof delta?.reasoning === 'string' && delta.reasoning) reasoning += delta.reasoning;
+    if (chunk) {
+      content += chunk;
       const currentReply = readPartialReply(content);
       if (currentReply.startsWith(emittedReply) && currentReply.length > emittedReply.length) {
         onTextDelta(currentReply.slice(emittedReply.length));
@@ -178,7 +182,7 @@ async function readStreamingCompletion(
   } finally {
     reader.releaseLock();
   }
-  return { content, ...(totalTokens === undefined ? {} : { totalTokens }) };
+  return { content, reasoning, ...(totalTokens === undefined ? {} : { totalTokens }) };
 }
 
 /** Decode the reply JSON string while the enclosing JSON object is still arriving. */
@@ -202,42 +206,84 @@ function readPartialReply(content: string): string {
   return '';
 }
 
-/** Exported for tests: a model reply is untrusted text, not an action. */
+/** Exported for tests: a model reply is untrusted text, not an action. Never throws — always returns a best-effort reply so chat keeps working with small / reasoning models. */
 export function parseModelOutput(
   content: string,
   options: { id: string; kind: 'local' | 'cloud' },
   totalTokens?: number,
 ): InferenceResponse {
+  const usage = totalTokens === undefined ? {} : { usage: { totalTokens } };
+  const trimmed = content.trim();
+  const plainFallback = (): InferenceResponse => ({
+    provider: options.id,
+    confidence: 0.5,
+    proposal: null,
+    reply: trimmed ? trimmed.slice(0, 4000) : null,
+    ...usage,
+  });
+
   let decoded: unknown;
   try {
     decoded = JSON.parse(extractJson(content));
   } catch {
-    throw new InferenceError('invalid_output', `${options.id}_not_json`);
+    return plainFallback();
+  }
+  if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {
+    return plainFallback();
+  }
+  const obj = decoded as Record<string, unknown>;
+
+  const rawAction = obj.action;
+  const action: ActionName | null = typeof rawAction === 'string' && (ACTION_NAMES as readonly string[]).includes(rawAction)
+    ? rawAction as ActionName
+    : null;
+  const rawArgs = obj.args;
+  const args: Record<string, unknown> = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? rawArgs as Record<string, unknown> : {};
+
+  let confidence = 0.5;
+  const rawConfidence = obj.confidence;
+  if (typeof rawConfidence === 'number' && Number.isFinite(rawConfidence)) {
+    confidence = rawConfidence > 1 ? Math.max(0, Math.min(1, rawConfidence / 100)) : Math.max(0, Math.min(1, rawConfidence));
+  } else if (typeof rawConfidence === 'string') {
+    const parsedNumber = Number(rawConfidence);
+    if (Number.isFinite(parsedNumber)) confidence = parsedNumber > 1 ? Math.max(0, Math.min(1, parsedNumber / 100)) : Math.max(0, Math.min(1, parsedNumber));
   }
 
-  const parsed = modelOutputSchema.safeParse(decoded);
-  if (!parsed.success) {
-    throw new InferenceError('invalid_output', `${options.id}_bad_shape`);
+  const rawReply = obj.reply ?? obj.message ?? obj.text ?? obj.answer ?? obj.content;
+  let reply: string | null = null;
+  if (typeof rawReply === 'string' && rawReply.trim()) reply = rawReply.slice(0, 4000);
+  else if (typeof rawReply === 'number' && Number.isFinite(rawReply)) reply = String(rawReply);
+
+  const rawToolCalls = obj.tool_calls ?? obj.toolCalls ?? obj.tools;
+  const toolCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
+  if (Array.isArray(rawToolCalls)) {
+    for (const entry of rawToolCalls.slice(0, 4)) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+      const candidate = entry as Record<string, unknown>;
+      const name = candidate.name;
+      if (typeof name !== 'string' || !name.trim() || name.length > 40) continue;
+      const callArgs = candidate.args;
+      toolCalls.push({ name: name.slice(0, 40), args: callArgs && typeof callArgs === 'object' && !Array.isArray(callArgs) ? callArgs as Record<string, unknown> : {} });
+    }
   }
 
-  const action: ActionName | null = parsed.data.action;
   if (action && options.kind === 'local' && !isLocalAction(action)) {
     return {
       provider: options.id,
       confidence: 0,
       proposal: null,
       reply: 'That action needs cloud reasoning and your approval.',
-      ...(totalTokens === undefined ? {} : { usage: { totalTokens } }),
+      ...usage,
     };
   }
 
   return {
     provider: options.id,
-    confidence: parsed.data.confidence,
-    proposal: action ? { action, args: parsed.data.args } : null,
-    reply: parsed.data.reply,
-    ...(parsed.data.tool_calls.length ? { toolCalls: parsed.data.tool_calls } : {}),
-    ...(totalTokens === undefined ? {} : { usage: { totalTokens } }),
+    confidence,
+    proposal: action ? { action, args } : null,
+    reply,
+    ...(toolCalls.length ? { toolCalls } : {}),
+    ...usage,
   };
 }
 

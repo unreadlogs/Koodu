@@ -27,16 +27,17 @@ class KooduSocket {
   connect() { this.stopped = false; if (!this.socket || this.socket.readyState === WebSocket.CLOSED) this.open(); }
   disconnect() { this.stopped = true; if (this.reconnectTimer !== undefined) window.clearTimeout(this.reconnectTimer); this.socket?.close(); }
 
-  async request<T = any>(method: RpcMethod, payload: Record<string, unknown> = {}, options: { onStream?: (event: AgentStreamPayload) => void } = {}): Promise<T> {
+  async request<T = any>(method: RpcMethod, payload: Record<string, unknown> = {}, options: { onStream?: (event: AgentStreamPayload) => void; timeoutMs?: number } = {}): Promise<T> {
     this.connect();
     await this.whenReady();
     if (this.pending.size >= 128) throw new Error('Too many pending WebSocket requests.');
     const id = crypto.randomUUID();
+    const timeoutMs = options.timeoutMs ?? (method === 'agent.run' || method === 'chats.send' ? 120_000 : 30_000);
     return new Promise<T>((resolve, reject) => {
       const timer = window.setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`WebSocket request timed out: ${method}`));
-      }, 30_000);
+      }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer, method, onStream: options.onStream });
       try { this.socket?.send(JSON.stringify({ type: 'request', id, method, payload })); }
       catch { window.clearTimeout(timer); this.pending.delete(id); reject(new Error('WebSocket is not available.')); }

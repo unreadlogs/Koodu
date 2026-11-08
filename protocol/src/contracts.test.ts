@@ -2,10 +2,13 @@ import { describe, expect, it } from 'vitest';
 import {
   ACTION_POLICIES,
   actionArgsSchemas,
+  defaultWorkspaceSettings,
   localProposalSchema,
   normalizeRoute,
   parseAppEvent,
+  rpcPayloadSchemas,
   validateInboundFrameMessage,
+  workspaceSettingsSchema,
 } from './index';
 
 describe('normalizeRoute', () => {
@@ -128,5 +131,27 @@ describe('iframe message validation', () => {
       expected,
     );
     expect(result.ok).toBe(true);
+  });
+});
+
+describe('workspace settings', () => {
+  it('accepts the default settings', () => {
+    expect(workspaceSettingsSchema.safeParse(defaultWorkspaceSettings).success).toBe(true);
+    expect(rpcPayloadSchemas['settings.save'].safeParse(defaultWorkspaceSettings).success).toBe(true);
+  });
+
+  it('rejects unknown characters, pets, routes and extra keys', () => {
+    expect(workspaceSettingsSchema.safeParse({ ...defaultWorkspaceSettings, character: 'dragon' }).success).toBe(false);
+    expect(workspaceSettingsSchema.safeParse({ ...defaultWorkspaceSettings, petMode: 'orbit' }).success).toBe(false);
+    expect(workspaceSettingsSchema.safeParse({ ...defaultWorkspaceSettings, startupPage: '/admin' }).success).toBe(false);
+    expect(workspaceSettingsSchema.safeParse({ ...defaultWorkspaceSettings, apiKey: 'secret' }).success).toBe(false);
+  });
+
+  it('accepts every pet mode and workspace startup page', () => {
+    for (const petMode of ['embedded', 'floating', 'hidden'] as const) {
+      expect(workspaceSettingsSchema.safeParse({ ...defaultWorkspaceSettings, petMode }).success).toBe(true);
+    }
+    expect(workspaceSettingsSchema.safeParse({ ...defaultWorkspaceSettings, startupPage: '/workspace/models' }).success).toBe(true);
+    expect(workspaceSettingsSchema.safeParse({ ...defaultWorkspaceSettings, startupPage: '/' }).success).toBe(true);
   });
 });

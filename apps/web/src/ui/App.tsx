@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { HugeiconsIcon, type IconSvgElement } from '@hugeicons/react';
 import {
   AiSecurity02Icon, ArrowRight01Icon, CommandIcon, CpuIcon, DashboardSpeed01Icon,
@@ -9,8 +9,8 @@ import {
   PuzzleIcon, BookOpen01Icon, Upload01Icon,
   Message01Icon,
 } from '@hugeicons/core-free-icons';
-import { AGENT_DESCRIPTORS, AGENT_TYPES, type AgentType } from '@koodu/protocol';
-import type { RpcLogEntry, WorkspaceRoute } from '@koodu/protocol';
+import { AGENT_DESCRIPTORS, AGENT_TYPES, defaultWorkspaceSettings, workspaceSettingsSchema, type AgentType } from '@koodu/protocol';
+import type { RpcLogEntry, SettingsSnapshot, WorkspaceRoute, WorkspaceSettings } from '@koodu/protocol';
 import { kooduSocket, type SocketState } from '../lib/socket';
 import { usePetController } from '../pet/pet-controller';
 
@@ -18,9 +18,32 @@ type PetActivity = 'idle' | 'listening' | 'thinking' | 'working' | 'talking' | '
 type Animation = { file: string; frameCount: number; frameWidth: number; frameHeight: number; fps: number; loop: boolean };
 const fallbackIdleAnimation: Animation = { file: 'idle.png', frameCount: 6, frameWidth: 512, frameHeight: 512, fps: 8, loop: true };
 type StartupPage = '/' | WorkspaceRoute;
-type AppPreferences = { animateCompanion: boolean; showCommandHint: boolean; startupPage: StartupPage };
+type AppPreferences = Pick<WorkspaceSettings, 'animateCompanion' | 'showCommandHint' | 'startupPage'>;
 const PREFERENCES_KEY = 'koodu:settings:v1';
-const defaultPreferences: AppPreferences = { animateCompanion: true, showCommandHint: true, startupPage: '/' };
+const COMPANION_KEY = 'koodu:companion';
+// Browser holds only a validated write-through cache for instant startup.
+// The server SQLite row is authoritative; cache values are never auto-uploaded.
+function readCachedSettings(): WorkspaceSettings {
+  try {
+    const stored = JSON.parse(localStorage.getItem(PREFERENCES_KEY) ?? 'null') as Partial<WorkspaceSettings> | null;
+    const candidate = stored?.startupPage;
+    const startupPage: StartupPage = candidate === '/' || pages.some((page) => page.route === candidate) ? candidate as StartupPage : '/';
+    const cachedCharacter = stored?.character ?? localStorage.getItem(COMPANION_KEY);
+    return {
+      character: cachedCharacter === 'kitsu' || cachedCharacter === 'kumo' ? cachedCharacter : defaultWorkspaceSettings.character,
+      animateCompanion: typeof stored?.animateCompanion === 'boolean' ? stored.animateCompanion : defaultWorkspaceSettings.animateCompanion,
+      showCommandHint: typeof stored?.showCommandHint === 'boolean' ? stored.showCommandHint : defaultWorkspaceSettings.showCommandHint,
+      startupPage,
+      petMode: stored?.petMode === 'floating' || stored?.petMode === 'hidden' || stored?.petMode === 'embedded' ? stored.petMode : defaultWorkspaceSettings.petMode,
+    };
+  } catch { return defaultWorkspaceSettings; }
+}
+function writeCachedSettings(settings: WorkspaceSettings) {
+  try {
+    localStorage.setItem(PREFERENCES_KEY, JSON.stringify({ animateCompanion: settings.animateCompanion, showCommandHint: settings.showCommandHint, startupPage: settings.startupPage, petMode: settings.petMode }));
+    localStorage.setItem(COMPANION_KEY, settings.character);
+  } catch { /* Cache is best-effort; the server copy remains authoritative. */ }
+}
 const homeCopy: Record<PetActivity, { lead: string; accent: string; detail: string }> = {
   idle: { lead: 'What are we', accent: 'working on?', detail: 'Open a page or enter a command.' },
   listening: { lead: 'I’m', accent: 'listening.', detail: 'Go ahead. I’m here.' },
@@ -46,15 +69,6 @@ const pages: RoutePage[] = [
 
 type LogEntry = RpcLogEntry;
 
-function readPreferences(): AppPreferences {
-  try {
-    const value = JSON.parse(localStorage.getItem(PREFERENCES_KEY) ?? 'null') as Partial<AppPreferences> | null;
-    const candidate = value?.startupPage;
-    const startupPage: StartupPage = candidate === '/' || pages.some((page) => page.route === candidate) ? candidate as StartupPage : '/';
-    return { animateCompanion: typeof value?.animateCompanion === 'boolean' ? value.animateCompanion : true, showCommandHint: typeof value?.showCommandHint === 'boolean' ? value.showCommandHint : true, startupPage };
-  } catch { return defaultPreferences; }
-}
-
 function AppIcon({ icon, size, className }: { icon: IconSvgElement; size: number; className?: string }) {
   return <HugeiconsIcon icon={icon} size={size} className={className} aria-hidden="true"/>;
 }
@@ -64,7 +78,7 @@ function pageFromPath(path: string) { return pages.find((page) => page.route ===
 function useRoute() {
   const [path, setPath] = useState(() => {
     if (location.pathname !== '/') return location.pathname;
-    const startupPage = readPreferences().startupPage;
+    const startupPage = readCachedSettings().startupPage;
     if (startupPage !== '/') history.replaceState({}, '', startupPage);
     return startupPage;
   });
@@ -89,41 +103,134 @@ function useRealtime() {
     kooduSocket.connect();
     const unsubscribe = kooduSocket.subscribe(update);
     update();
-    // Temporarily disable client heartbeat frames while inspecting application RPC traffic.
-    // kooduSocket.ping();
-    // const heartbeat = window.setInterval(() => kooduSocket.ping(), 5000);
+    kooduSocket.ping();
+    const heartbeat = window.setInterval(() => kooduSocket.ping(), 5000);
     return () => {
-      // window.clearInterval(heartbeat);
+      window.clearInterval(heartbeat);
       unsubscribe();
     };
   }, []);
   return { ...snapshot, status: snapshot.state };
 }
 
+type SettingsStatus = 'loading' | 'ready' | 'saving' | 'error';
+
 function App() {
   const { path, navigate } = useRoute();
   const realtime = useRealtime();
   const currentPage = pageFromPath(path);
-  const [character, setCharacter] = useState<'kumo' | 'kitsu'>(() => localStorage.getItem('koodu:companion') === 'kitsu' ? 'kitsu' : 'kumo');
-  const [preferences, setPreferences] = useState<AppPreferences>(readPreferences);
+  // Server is source of truth; state starts from the validated cache for instant paint.
+  const [settings, setSettings] = useState<WorkspaceSettings>(readCachedSettings);
+  const settingsRef = useRef<WorkspaceSettings>(settings);
+  const [settingsMeta, setSettingsMeta] = useState<{ updatedAt: string | null; persistence: string }>({ updatedAt: null, persistence: 'sqlite' });
+  const [settingsStatus, setSettingsStatus] = useState<SettingsStatus>('loading');
+  const [settingsError, setSettingsError] = useState('');
+  const [settingsNotice, setSettingsNotice] = useState('');
+  const character = settings.character;
   const activity = usePetController((state) => state.activity);
   const dispatchPetAction = usePetController((state) => state.dispatchAction);
+  const petMode = usePetController((state) => state.mode);
+  const setPetMode = usePetController((state) => state.setMode);
   const [animations, setAnimations] = useState<Record<string, Animation>>({});
   const [command, setCommand] = useState('');
   const [feedback, setFeedback] = useState('');
   useEffect(() => {
     let cancelled = false;
-    kooduSocket.request<{ animations?: Record<string, Animation> } & Record<string, Animation>>('companion.manifest', { character })
+    fetch(`/companion/${character}/animation_manifest.json`)
+      .then((response) => (response.ok ? response.json() : null))
       .then((manifest) => {
-        if (!cancelled) setAnimations(manifest?.animations ?? manifest ?? {});
+        if (!cancelled) setAnimations((manifest?.animations ?? manifest) ?? {});
       })
       .catch(() => { if (!cancelled) setAnimations({}); });
     return () => { cancelled = true; };
   }, [character]);
 
-  useEffect(() => { localStorage.setItem('koodu:companion', character); }, [character]);
-  useEffect(() => { localStorage.setItem(PREFERENCES_KEY, JSON.stringify(preferences)); }, [preferences]);
-  const updatePreferences = (changes: Partial<AppPreferences>) => setPreferences((current) => ({ ...current, ...changes }));
+  const applyServerSettings = (snapshot: SettingsSnapshot) => {
+    settingsRef.current = snapshot.settings;
+    setSettings(snapshot.settings);
+    setSettingsMeta({ updatedAt: snapshot.updatedAt, persistence: snapshot.persistence });
+    writeCachedSettings(snapshot.settings);
+    setPetMode(snapshot.settings.petMode);
+  };
+  const loadServerSettings = async () => {
+    setSettingsStatus((current) => current === 'error' || current === 'ready' ? 'loading' : current);
+    setSettingsError('');
+    try {
+      const snapshot = await kooduSocket.request<SettingsSnapshot>('settings.get');
+      applyServerSettings(snapshot);
+      setSettingsStatus('ready');
+    } catch (error) {
+      setSettingsStatus('error');
+      setSettingsError(error instanceof Error ? error.message : 'Could not load settings from the server.');
+    }
+  };
+  useEffect(() => { void loadServerSettings(); }, []);
+  // If the server startup page differs from the cached one used for first paint, follow it once.
+  const initialPathRef = useRef(path);
+  const startupAppliedRef = useRef(false);
+  useEffect(() => {
+    if (startupAppliedRef.current || settingsStatus !== 'ready') return;
+    startupAppliedRef.current = true;
+    if (initialPathRef.current === '/' && settings.startupPage !== '/' && location.pathname === '/') navigate(settings.startupPage);
+  }, [settingsStatus, settings.startupPage, navigate]);
+
+  const saveSettings = async (next: WorkspaceSettings) => {
+    const previous = settingsRef.current;
+    settingsRef.current = next;
+    setSettings(next);
+    writeCachedSettings(next);
+    setPetMode(next.petMode);
+    setSettingsStatus('saving');
+    setSettingsError('');
+    setSettingsNotice('');
+    try {
+      const snapshot = await kooduSocket.request<SettingsSnapshot>('settings.save', next as unknown as Record<string, unknown>);
+      applyServerSettings(snapshot);
+      setSettingsStatus('ready');
+    } catch (error) {
+      settingsRef.current = previous;
+      setSettings(previous);
+      writeCachedSettings(previous);
+      setPetMode(previous.petMode);
+      setSettingsStatus('error');
+      setSettingsError(error instanceof Error ? error.message : 'Could not save settings on the server.');
+    }
+  };
+  const updatePreferences = (changes: Partial<AppPreferences>) => { void saveSettings({ ...settingsRef.current, ...changes }); };
+  const setCharacter = (value: 'kumo' | 'kitsu') => { void saveSettings({ ...settingsRef.current, character: value }); };
+  const resetSettings = async () => {
+    setSettingsStatus('saving'); setSettingsError(''); setSettingsNotice('');
+    try {
+      const snapshot = await kooduSocket.request<SettingsSnapshot>('settings.reset');
+      applyServerSettings(snapshot);
+      setSettingsStatus('ready');
+      setSettingsNotice('Settings reset to defaults on the server.');
+    } catch (error) {
+      setSettingsStatus('error');
+      setSettingsError(error instanceof Error ? error.message : 'Could not reset settings on the server.');
+    }
+  };
+  const exportSettings = () => {
+    const payload = JSON.stringify({ ...settings, updatedAt: settingsMeta.updatedAt }, null, 2);
+    const url = URL.createObjectURL(new Blob([payload], { type: 'application/json' }));
+    const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'koodu-settings.json'; anchor.click(); URL.revokeObjectURL(url);
+  };
+  const importSettings = async (file: File) => {
+    setSettingsError(''); setSettingsNotice('');
+    try {
+      const parsed = JSON.parse(await file.text()) as unknown;
+      const candidate = parsed && typeof parsed === 'object' && 'settings' in (parsed as Record<string, unknown>)
+        ? (parsed as { settings: unknown }).settings
+        : parsed;
+      const checked = workspaceSettingsSchema.safeParse(candidate);
+      if (!checked.success) throw new Error('Import file does not contain valid Koodu settings.');
+      await saveSettings(checked.data);
+      setSettingsNotice('Settings imported and saved on the server.');
+    } catch (error) {
+      setSettingsError(error instanceof Error ? error.message : 'Import failed. Check the JSON file.');
+      setSettingsStatus('error');
+    }
+  };
 
   const submit = async () => {
     const text = command.trim();
@@ -164,13 +271,13 @@ function App() {
     <section className="main-column">
       <section className={`page-canvas ${currentPage ? 'route-page' : 'home-page'}`}>
         <div className="canvas-grain"/>
-        {currentPage ? <ModulePage page={currentPage} character={character} setCharacter={setCharacter} preferences={preferences} updatePreferences={updatePreferences} connection={realtime}/> : <HomePage activity={activity} character={character} animations={animations} animateCompanion={preferences.animateCompanion}/>}
+        {currentPage ? <ModulePage page={currentPage} character={character} setCharacter={setCharacter} preferences={settings} updatePreferences={updatePreferences} settingsControls={{ meta: settingsMeta, status: settingsStatus, error: settingsError, notice: settingsNotice, onRefresh: () => void loadServerSettings(), onReset: () => void resetSettings(), onExport: exportSettings, onImport: (file) => void importSettings(file) }} connection={realtime}/> : <HomePage activity={activity} character={character} animations={animations} animateCompanion={settings.animateCompanion} petMode={petMode}/>}
         {feedback && <div className="command-feedback"><span className="feedback-spark"><AppIcon icon={SparklesIcon} size={13}/></span>{feedback}</div>}
-        {!currentPage && <CommandBar value={command} setValue={setCommand} submit={submit} showHint={preferences.showCommandHint}/>}
+        {!currentPage && <CommandBar value={command} setValue={setCommand} submit={submit} showHint={settings.showCommandHint}/>}
         <div className="bottom-status"><span><i className={realtime.status}/> {realtime.status === 'online' ? 'CONNECTED' : realtime.status === 'connecting' ? 'CONNECTING' : 'RECONNECTING'}</span><span>WS <b/> PING: {realtime.ping === null ? '—' : `${realtime.ping}ms`} <span className="ping-bars"><i/><i/><i/><i/></span></span></div>
       </section>
     </section>
-
+    {petMode !== 'hidden' && <FloatingPet activity={activity} character={character} animations={animations} animate={settings.animateCompanion} mode={petMode} large={!currentPage} onModeChange={setPetMode} onCharacterChange={setCharacter}/>}
   </main>;
 }
 
@@ -178,15 +285,15 @@ function NavItem({ label, icon, selected, onClick }: { label: string; icon: Icon
   return <button className={`nav-item ${selected ? 'selected' : ''}`} title={label} aria-label={label} onClick={onClick}><AppIcon icon={icon} size={17}/><span className="nav-tooltip">{label}</span></button>;
 }
 
-function HomePage({ activity, character, animations, animateCompanion }: { activity: PetActivity; character: 'kumo' | 'kitsu'; animations: Record<string, Animation>; animateCompanion: boolean }) {
+function HomePage({ activity, character, animations, animateCompanion, petMode }: { activity: PetActivity; character: 'kumo' | 'kitsu'; animations: Record<string, Animation>; animateCompanion: boolean; petMode: 'floating' | 'embedded' | 'hidden' }) {
   const copy = homeCopy[activity];
   return <>
     <div className="home-heading"><div><span className="eyebrow">KOODU / HOME</span><h1 aria-live="polite"><span>{copy.lead} </span><em>{copy.accent}</em></h1><p>{copy.detail}</p></div></div>
-    <div className="home-scene">
+    <div className={`home-scene pet-mode-${petMode}`}>
       <div className="ambient ambient-left"/><div className="ambient ambient-right"/>
       <div className="scene-mark scene-mark-one"/><div className="scene-mark scene-mark-two"/>
-      <PetCharacter activity={activity} character={character} animations={animations} animate={animateCompanion}/>
-      <div className="pet-nameplate"><span className="character-name">{character === 'kumo' ? 'KUMO' : 'KITSU'}</span></div>
+      {petMode === 'hidden' ? <div className="pet-hidden-note"><strong>Companion hidden</strong><span>Change display mode in Settings.</span></div> : null}
+      {petMode !== 'hidden' && petMode !== 'floating' && <div className="pet-nameplate"><span className="character-name">{character === 'kumo' ? 'KUMO' : 'KITSU'}</span></div>}
     </div>
   </>;
 }
@@ -213,13 +320,18 @@ function SpriteSheet({ character, animation, size = 250, animate = true, loop }:
   return <span className="sprite-sheet" role="img" aria-label={`${character} companion animation`} style={{ width: dynamicSize ? size : `${size}px`, height: dynamicSize ? 'auto' : `${size * animation.frameHeight / animation.frameWidth}px`, aspectRatio: `${animation.frameWidth} / ${animation.frameHeight}`, backgroundImage: `url(/companion/${character}/${animation.file})`, backgroundPosition: `${framePercent}% 0`, backgroundSize: `${animation.frameCount * 100}% 100%` }}/>;
 }
 
-function ModulePage({ page, character, setCharacter, preferences, updatePreferences, connection }: { page: RoutePage; character: 'kumo' | 'kitsu'; setCharacter: (value: 'kumo' | 'kitsu') => void; preferences: AppPreferences; updatePreferences: (changes: Partial<AppPreferences>) => void; connection: { status: 'connecting' | 'online' | 'offline'; ping: number | null } }) {
+type SettingsControls = { meta: { updatedAt: string | null; persistence: string }; status: SettingsStatus; error: string; notice: string; onRefresh: () => void; onReset: () => void; onExport: () => void; onImport: (file: File) => void };
+
+function ModulePage({ page, character, setCharacter, preferences, updatePreferences, settingsControls, connection }: { page: RoutePage; character: 'kumo' | 'kitsu'; setCharacter: (value: 'kumo' | 'kitsu') => void; preferences: WorkspaceSettings; updatePreferences: (changes: Partial<AppPreferences> & { petMode?: WorkspaceSettings['petMode'] }) => void; settingsControls: SettingsControls; connection: { status: 'connecting' | 'online' | 'offline'; ping: number | null } }) {
+  if (page.label === 'Chats') {
+    return <div className="module-page-content chats-fullbleed"><ChatsPage/></div>;
+  }
   return <div className={`module-page-content ${page.label === 'Settings' ? 'settings-page-content' : ''}`}>
     <div className="module-heading">
       <div><div className="eyebrow">KOODU / WORKSPACE / {page.label.toUpperCase()}</div><h1>{page.label}</h1><p>{page.subtitle}</p></div>
       <span className="module-page-icon"><AppIcon icon={page.icon} size={19}/></span>
     </div>
-    {page.label === 'Settings' ? <SettingsPage character={character} setCharacter={setCharacter} preferences={preferences} updatePreferences={updatePreferences} connection={connection}/>
+    {page.label === 'Settings' ? <SettingsPage character={character} setCharacter={setCharacter} preferences={preferences} updatePreferences={updatePreferences} settingsControls={settingsControls} connection={connection}/>
     : page.label === 'Memory' ? <MemoryPage/>
     : page.label === 'Agents' ? <AgentsPage/>
     : page.label === 'Chats' ? <ChatsPage/>
@@ -495,6 +607,56 @@ function MemoryPage() {
 
 type ChatConversation = { id: string; title: string; createdAt: string; updatedAt: string; messageCount: number };
 type ChatMessage = { id: string; role: 'user' | 'assistant'; content: string; createdAt: string };
+
+const chatSuggestions = ['Could you introduce yourself?', 'What can you help me with?', 'Help me organize my workspace'];
+
+function renderChatInline(text: string): ReactNode {
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((part, index) => {
+    if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
+      return <strong key={index}>{part.slice(2, -2)}</strong>;
+    }
+    return <span key={index}>{part}</span>;
+  });
+}
+
+function AssistantContent({ content }: { content: string }) {
+  const lines = content.split('\n');
+  const nodes: ReactNode[] = [];
+  let list: string[] = [];
+  let listType: 'ol' | 'ul' | null = null;
+  const flush = () => {
+    if (!list.length) return;
+    if (listType === 'ol') {
+      nodes.push(<ol key={`list-${nodes.length}`}>{list.map((item, index) => <li key={index}>{renderChatInline(item)}</li>)}</ol>);
+    } else {
+      nodes.push(<ul key={`list-${nodes.length}`}>{list.map((item, index) => <li key={index}>{renderChatInline(item)}</li>)}</ul>);
+    }
+    list = [];
+    listType = null;
+  };
+  lines.forEach((line, index) => {
+    const trimmed = line.trim();
+    if (!trimmed) { flush(); return; }
+    const numbered = trimmed.match(/^(\d+)[\.\)]\s+(.*)/);
+    const bullet = trimmed.match(/^[-*•]\s+(.*)/);
+    if (numbered) {
+      if (listType !== 'ol') flush();
+      listType = 'ol';
+      list.push(numbered[2] ?? '');
+    } else if (bullet) {
+      if (listType !== 'ul') flush();
+      listType = 'ul';
+      list.push(bullet[1] ?? '');
+    } else {
+      flush();
+      nodes.push(<p key={index}>{renderChatInline(line)}</p>);
+    }
+  });
+  flush();
+  return <div className="chat-assistant-body">{nodes}</div>;
+}
+
 function ChatsPage() {
   const [conversations, setConversations] = useState<ChatConversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -504,8 +666,13 @@ function ChatsPage() {
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
+  const [query, setQuery] = useState('');
   const messageListRef = useRef<HTMLDivElement>(null);
-  useEffect(() => { const element = messageListRef.current; if (element) element.scrollTop = element.scrollHeight; }, [messages]);
+  const suppressLoadRef = useRef(false);
+  useEffect(() => { const element = messageListRef.current; if (element) element.scrollTop = element.scrollHeight; }, [messages, sending]);
+
+  const activeConversation = conversations.find((item) => item.id === activeId) ?? null;
+  const visibleConversations = conversations.filter((item) => item.title.toLowerCase().includes(query.toLowerCase()));
 
   const loadConversations = async () => {
     const result = await kooduSocket.request<{ conversations: ChatConversation[] }>('chats.list');
@@ -521,6 +688,7 @@ function ChatsPage() {
   }, []);
   useEffect(() => {
     if (!activeId) { setMessages([]); return; }
+    if (suppressLoadRef.current) { suppressLoadRef.current = false; return; }
     let alive = true;
     setMessages([]); setError('');
     kooduSocket.request<{ messages: ChatMessage[] }>('chats.messages', { conversationId: activeId })
@@ -535,7 +703,8 @@ function ChatsPage() {
       const result = await kooduSocket.request<{ conversation: ChatConversation }>('chats.create', {});
       setConversations((items) => [result.conversation, ...items]);
       setActiveId(result.conversation.id);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not create a chat.'); }
+      return result.conversation.id;
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not create a chat.'); return null; }
   };
   const deleteConversation = async (conversationId: string) => {
     setError('');
@@ -548,9 +717,25 @@ function ChatsPage() {
   };
   const sendMessage = async () => {
     const text = draft.trim();
-    const conversationId = activeId;
-    if (!text || !conversationId || sending) return;
-    setDraft(''); setSending(true); setError('');
+    if (!text || sending) return;
+    setSending(true); setError('');
+    let conversationId = activeId;
+    try {
+      if (!conversationId) {
+        suppressLoadRef.current = true;
+        const created = await kooduSocket.request<{ conversation: ChatConversation }>('chats.create', {});
+        conversationId = created.conversation.id;
+        setConversations((items) => [created.conversation, ...items]);
+        setActiveId(conversationId);
+      }
+    } catch (reason) {
+      suppressLoadRef.current = false;
+      setSending(false);
+      setError(reason instanceof Error ? reason.message : 'Could not create a chat.');
+      return;
+    }
+    if (!conversationId) { setSending(false); return; }
+    setDraft('');
     const userMessage: ChatMessage = { id: crypto.randomUUID(), role: 'user', content: text, createdAt: new Date().toISOString() };
     const assistantId = crypto.randomUUID();
     const pendingAssistant: ChatMessage = { id: assistantId, role: 'assistant', content: '', createdAt: new Date().toISOString() };
@@ -570,16 +755,40 @@ function ChatsPage() {
 
   return <section className="chats-layout">
     <aside className="chat-conversation-panel">
-      <div className="chat-list-heading"><div><strong>Conversations</strong><small>{conversations.length} saved</small></div><button className="product-primary" onClick={() => void createConversation()} aria-label="New conversation" title="New conversation"><AppIcon icon={Add01Icon} size={15}/></button></div>
-      {loading ? <div className="chat-list-empty">Loading conversations…</div> : conversations.length ? <div className="chat-conversation-list">{conversations.map((conversation) => <div className={`chat-conversation-item ${activeId === conversation.id ? 'active' : ''}`} key={conversation.id}><button className="chat-conversation-select" onClick={() => setActiveId(conversation.id)}><strong>{conversation.title}</strong><small>{conversation.messageCount ? `${conversation.messageCount} messages` : 'New conversation'} · {new Date(conversation.updatedAt).toLocaleDateString()}</small></button><button className="chat-delete-button" aria-label={`Delete ${conversation.title}`} title="Delete conversation" onClick={() => void deleteConversation(conversation.id)}><AppIcon icon={Delete02Icon} size={14}/></button></div>)}</div> : <div className="chat-list-empty">No conversations yet.</div>}
+      <div className="chat-side-actions">
+        <button className="chat-new-button" onClick={() => void createConversation()}><AppIcon icon={Add01Icon} size={15}/> New chat</button>
+        <label className="chat-search"><AppIcon icon={Search01Icon} size={15}/><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search chats" aria-label="Search chats"/></label>
+      </div>
+      <div className="chat-list-label"><span>Conversations</span><span>{conversations.length} saved</span></div>
+      {loading ? <div className="chat-list-empty">Loading conversations…</div> : visibleConversations.length ? <div className="chat-conversation-list">{visibleConversations.map((conversation) => <div className={`chat-conversation-item ${activeId === conversation.id ? 'active' : ''}`} key={conversation.id}><button className="chat-conversation-select" onClick={() => setActiveId(conversation.id)}><strong>{conversation.title}</strong>{conversation.messageCount ? <small>{conversation.messageCount} messages</small> : null}</button><button className="chat-delete-button" aria-label={`Delete ${conversation.title}`} title="Delete conversation" onClick={() => void deleteConversation(conversation.id)}><AppIcon icon={Delete02Icon} size={13}/></button></div>)}</div> : <div className="chat-list-empty">{query ? 'No matching chats.' : 'No conversations yet.'}</div>}
     </aside>
     <div className="chat-thread">
-      {!activeId ? <div className="chat-welcome"><span className="chat-welcome-mark"><AppIcon icon={Message01Icon} size={22}/></span><strong>Your conversations, in one place.</strong><p>Start a chat to ask Koodu a question or work through a task.</p><button className="product-primary" onClick={() => void createConversation()}><AppIcon icon={Add01Icon} size={15}/> Start a conversation</button></div> : <>
-        <div className="chat-thread-top"><span><i/> PRIVATE CONVERSATION</span><label>MODEL ROUTE<select value={role} onChange={(event) => setRole(event.target.value as 'local' | 'cloud')} disabled={sending}><option value="cloud">Cloud</option><option value="local">Local</option></select></label></div>
-        <div className="chat-message-list" aria-live="polite" ref={messageListRef}>{messages.length ? messages.map((message) => <article className={`chat-message ${message.role}`} key={message.id}><span className="chat-message-author">{message.role === 'user' ? 'YOU' : 'KOODU'}</span><div>{message.content || (sending && message.role === 'assistant' ? <span className="chat-thinking"><i/> Thinking…</span> : '')}</div></article>) : <div className="chat-thread-empty"><strong>What would you like to work on?</strong><span>Your conversation history is saved on the server.</span></div>}</div>
-        <div className="chat-compose"><textarea aria-label="Message Koodu" value={draft} maxLength={1000} disabled={sending} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} placeholder="Message Koodu…" rows={2}/><div><span>ENTER TO SEND · SHIFT + ENTER FOR NEW LINE</span><button className="product-primary" aria-label="Send message" disabled={!draft.trim() || sending} onClick={() => void sendMessage()}>{sending ? <i className="tiny-spinner"/> : <AppIcon icon={ArrowRight01Icon} size={17}/>}</button></div></div>
-      </>}
-      {error && <div className="chat-error" role="alert">{error}</div>}
+      <header className="chat-thread-head">
+        <span className="chat-thread-title">{activeConversation ? activeConversation.title : 'Start a conversation'}</span>
+        <span className="chat-thread-meta">{activeConversation ? `${activeConversation.messageCount} messages · Saved on server` : 'Chats are saved on the server'}</span>
+      </header>
+      <div className="chat-message-list" aria-live="polite" ref={messageListRef}>
+        <div className="chat-column">
+          {!activeConversation && !messages.length ? <div className="chat-hero"><span className="chat-welcome-mark"><AppIcon icon={Message01Icon} size={22}/></span><strong>Meet Koodu</strong><p>Ask a question, describe a task, or type a page name. Koodu replies here and keeps history on the server.</p><div className="chat-suggestions">{chatSuggestions.map((suggestion) => <button key={suggestion} className="chat-suggestion-chip" onClick={() => setDraft(suggestion)}>{suggestion}</button>)}</div></div>
+          : messages.length ? messages.map((message) => {
+            if (message.role === 'user') return <div className="chat-row user-row" key={message.id}><div className="chat-user-bubble">{message.content}</div></div>;
+            if (!message.content && sending) return <article className="chat-row assistant-row" key={message.id}><div className="chat-thought"><span className="chat-thought-spin"/><span>Thought for a while</span><span aria-hidden="true">›</span></div></article>;
+            return <article className="chat-row assistant-row" key={message.id}><AssistantContent content={message.content}/></article>;
+          }) : <div className="chat-hero"><span className="chat-welcome-mark"><AppIcon icon={SparklesIcon} size={22}/></span><strong>What would you like to work on?</strong><p>Try one of these, or type your own message below.</p><div className="chat-suggestions">{chatSuggestions.map((suggestion) => <button key={suggestion} className="chat-suggestion-chip" onClick={() => setDraft(suggestion)}>{suggestion}</button>)}</div></div>}
+        </div>
+      </div>
+      <div className="chat-compose-wrap">
+        {error && <div className="chat-error-inline" role="alert"><AppIcon icon={Cancel01Icon} size={13}/><span>{error}</span></div>}
+        <div className="chat-compose">
+          <textarea aria-label="Message Koodu" value={draft} maxLength={1000} disabled={sending} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} placeholder="Message Koodu, describe a task, or ask a question…" rows={2}/>
+          <div className="chat-compose-bar">
+            <button className="chat-plus-btn" onClick={() => void createConversation()} aria-label="New chat" title="New chat"><AppIcon icon={Add01Icon} size={16}/></button>
+            <label className="chat-model-chip"><span className={`chat-model-dot ${role}`}/><select value={role} onChange={(event) => setRole(event.target.value as 'local' | 'cloud')} disabled={sending} aria-label="Model route"><option value="cloud">Cloud</option><option value="local">Local</option></select></label>
+            <span className="chat-compose-hint">ENTER TO SEND</span>
+            <button className="chat-send-btn" aria-label="Send message" disabled={!draft.trim() || sending} onClick={() => void sendMessage()}>{sending ? <i className="tiny-spinner"/> : <AppIcon icon={ArrowRight01Icon} size={16}/>}</button>
+          </div>
+        </div>
+      </div>
     </div>
   </section>;
 }
@@ -615,14 +824,34 @@ function AgentsPage() {
   </div>;
 }
 
-function SettingsPage({ character, setCharacter, preferences, updatePreferences, connection }: { character: 'kumo' | 'kitsu'; setCharacter: (value: 'kumo' | 'kitsu') => void; preferences: AppPreferences; updatePreferences: (changes: Partial<AppPreferences>) => void; connection: { status: 'connecting' | 'online' | 'offline'; ping: number | null } }) {
+function SettingsPage({ character, setCharacter, preferences, updatePreferences, settingsControls, connection }: { character: 'kumo' | 'kitsu'; setCharacter: (value: 'kumo' | 'kitsu') => void; preferences: WorkspaceSettings; updatePreferences: (changes: Partial<AppPreferences> & { petMode?: WorkspaceSettings['petMode'] }) => void; settingsControls: SettingsControls; connection: { status: 'connecting' | 'online' | 'offline'; ping: number | null } }) {
+  const { meta, status, error, notice, onRefresh, onReset, onExport, onImport } = settingsControls;
+  const importRef = useRef<HTMLInputElement>(null);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState('');
+  const [confirmReset, setConfirmReset] = useState(false);
+  const busy = status === 'saving' || status === 'loading';
+  const savedAt = meta.updatedAt ? new Date(meta.updatedAt.replace(' ', 'T') + (meta.updatedAt.endsWith('Z') ? '' : 'Z')).toLocaleString() : 'Defaults (not saved yet)';
+  const snapshotBytes = new Blob([JSON.stringify(preferences)]).size;
+  const testConnection = async () => {
+    setTesting(true); setTestResult('');
+    const started = performance.now();
+    try {
+      await kooduSocket.request('system.ping', { at: Date.now() });
+      const elapsed = Math.max(1, Math.round(performance.now() - started));
+      setTestResult(`Connected · round-trip ${elapsed} ms`);
+    } catch (reason) {
+      setTestResult(reason instanceof Error ? reason.message : 'Connection test failed.');
+    } finally { setTesting(false); }
+  };
   return <div className="settings-layout">
     <CharacterPicker character={character} setCharacter={setCharacter}/>
     <div className="settings-grid">
       <section className="settings-section">
-        <header><span><strong>Companion</strong><small>Animation and motion</small></span><AppIcon icon={SparklesIcon} size={16}/></header>
+        <header><span><strong>Companion</strong><small>Animation, motion and display</small></span><AppIcon icon={SparklesIcon} size={16}/></header>
         <div className="setting-info-row"><span><b>Selected character</b><small>Changed from the companion strip above.</small></span><strong>{character === 'kumo' ? 'Kumo' : 'Kitsu'}</strong></div>
         <SettingToggle label="Animate companion" detail="Play the character’s sprite animations." checked={preferences.animateCompanion} onChange={(checked) => updatePreferences({ animateCompanion: checked })}/>
+        <label className="setting-select-row"><span><b>Display mode</b><small>Embedded centers the pet, floating adds motion, hidden hides it on Home.</small></span><select value={preferences.petMode} onChange={(event) => updatePreferences({ petMode: event.target.value as WorkspaceSettings['petMode'] })}><option value="embedded">Embedded</option><option value="floating">Floating</option><option value="hidden">Hidden</option></select></label>
       </section>
       <section className="settings-section">
         <header><span><strong>Workspace</strong><small>Startup and command bar</small></span><AppIcon icon={DashboardSpeed01Icon} size={16}/></header>
@@ -630,14 +859,22 @@ function SettingsPage({ character, setCharacter, preferences, updatePreferences,
         <SettingToggle label="Show keyboard hint" detail="Display the Enter hint in the command bar." checked={preferences.showCommandHint} onChange={(checked) => updatePreferences({ showCommandHint: checked })}/>
       </section>
       <section className="settings-section">
-        <header><span><strong>Connection</strong><small>Local server status</small></span><span className={`settings-status ${connection.status}`}><i/>{connection.status}</span></header>
-        <div className="setting-info-row"><span><b>WebSocket</b><small>Central workspace connection</small></span><strong>{connection.ping === null ? 'Waiting for ping' : `${connection.ping} ms`}</strong></div>
-        <div className="setting-info-row"><span><b>Endpoint</b><small>Development server</small></span><strong className="setting-code">/ws</strong></div>
+        <header><span><strong>Connection</strong><small>Live WebSocket diagnostics</small></span><span className={`settings-status ${connection.status}`}><i/>{connection.status}</span></header>
+        <div className="setting-info-row"><span><b>WebSocket ping</b><small>Heartbeat every 5 seconds</small></span><strong>{connection.ping === null ? 'Waiting for ping' : `${connection.ping} ms`}</strong></div>
+        <div className="setting-info-row"><span><b>Endpoint</b><small>Central JSON-RPC channel</small></span><strong className="setting-code">/ws</strong></div>
+        <div className="setting-info-row"><span><b>Reconnect</b><small>Auto-reconnects after a drop</small></span><strong>{connection.status === 'online' ? 'CONNECTED' : connection.status === 'connecting' ? 'CONNECTING' : 'RECONNECTING'}</strong></div>
       </section>
       <section className="settings-section">
-        <header><span><strong>Privacy & data</strong><small>Browser storage</small></span><AppIcon icon={ShieldCheckIcon} size={16}/></header>
-        <div className="setting-info-row"><span><b>Companion and preferences</b><small>Saved locally in this browser.</small></span><strong>LOCAL</strong></div>
-        <div className="setting-info-row"><span><b>Credentials</b><small>API secrets are not stored here.</small></span><strong>SECURE</strong></div>
+        <header><span><strong>Storage & sync</strong><small>Server database</small></span><AppIcon icon={ShieldCheckIcon} size={16}/></header>
+        <div className="setting-info-row"><span><b>Source of truth</b><small>Server SQLite · browser keeps a validated cache only</small></span><strong>{meta.persistence.toUpperCase()}</strong></div>
+        <div className="setting-info-row"><span><b>Last saved</b><small>Written on every change</small></span><strong>{meta.updatedAt ? savedAt : 'Defaults'}</strong></div>
+        <div className="setting-info-row"><span><b>Credentials</b><small>API secrets are never stored as settings.</small></span><strong>SECURE</strong></div>
+        <div className="settings-actions">
+          <button className="product-secondary settings-mini-action" onClick={onExport}><AppIcon icon={Download01Icon} size={13}/> Export</button>
+          <button className="product-secondary settings-mini-action" onClick={() => importRef.current?.click()} disabled={busy}><AppIcon icon={Upload01Icon} size={13}/> Import</button>
+          <input ref={importRef} type="file" accept="application/json,.json" hidden onChange={(e) => { const file = e.target.files?.[0]; if (file) onImport(file); if (importRef.current) importRef.current.value = ''; }}/>
+          {confirmReset ? <span className="settings-reset-confirm"><button className="product-primary settings-mini-action" onClick={() => { setConfirmReset(false); onReset(); }} disabled={busy}>Confirm reset</button><button className="product-secondary settings-mini-action" onClick={() => setConfirmReset(false)}>Cancel</button></span> : <button className="product-secondary settings-mini-action danger" onClick={() => setConfirmReset(true)} disabled={busy}><AppIcon icon={Delete01Icon} size={13}/> Reset</button>}
+        </div>
       </section>
     </div>
   </div>;
@@ -660,7 +897,7 @@ function CharacterOption({ id, selected, onSelect }: { id: 'kumo' | 'kitsu'; sel
   const [happy, setHappy] = useState<Animation | null>(null);
   useEffect(() => {
     let cancelled = false;
-    kooduSocket.request<{ animations?: Record<string, Animation> } & Record<string, Animation>>('companion.manifest', { character: id }).then((manifest) => {
+    fetch(`/companion/${id}/animation_manifest.json`).then((response) => (response.ok ? response.json() : null)).then((manifest) => {
       const animations = manifest?.animations ?? manifest;
       if (!cancelled && animations?.happy) setHappy(animations.happy as Animation);
     }).catch(() => {});
@@ -676,6 +913,84 @@ function CharacterOption({ id, selected, onSelect }: { id: 'kumo' | 'kitsu'; sel
 
 function CommandBar({ value, setValue, submit, showHint }: { value: string; setValue: (value: string) => void; submit: () => void; showHint: boolean }) {
   return <div className="command-bar"><button title="Voice input" className="command-mic"><AppIcon icon={Mic01Icon} size={17}/></button><span className="command-prompt">›</span><input value={value} onChange={(event) => setValue(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') submit(); }} placeholder="Type a command, open a page, or ask Koodu…"/>{showHint && <span className="command-hint"><AppIcon icon={CommandIcon} size={10}/> ENTER</span>}<button className="command-send" onClick={submit} title="Send command"><AppIcon icon={ArrowRight01Icon} size={20}/></button></div>;
+}
+
+function FloatingPet({ activity, character, animations, animate, mode, large, onModeChange, onCharacterChange }: { activity: PetActivity; character: 'kumo' | 'kitsu'; animations: Record<string, Animation>; animate: boolean; mode: 'floating' | 'embedded' | 'hidden'; large: boolean; onModeChange: (mode: 'floating' | 'embedded' | 'hidden') => void; onCharacterChange: (value: 'kumo' | 'kitsu') => void }) {
+  const animation = animations[activity] ?? animations.idle ?? fallbackIdleAnimation;
+  const storageKey = 'koodu:pet-position:v1';
+  const [pos, setPos] = useState<{ x: number; y: number }>(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(storageKey) ?? 'null');
+      if (saved && typeof saved.x === 'number' && typeof saved.y === 'number') return { x: saved.x, y: saved.y };
+    } catch { /* ignore */ }
+    return { x: Math.max(20, window.innerWidth - 160), y: Math.max(20, window.innerHeight - 180) };
+  });
+  const [dragging, setDragging] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [menuPos, setMenuPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const dragOffset = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const movedRef = useRef(false);
+
+  useEffect(() => {
+    localStorage.setItem(storageKey, JSON.stringify(pos));
+  }, [pos]);
+
+  const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    movedRef.current = false;
+    setDragging(true);
+    dragOffset.current = { x: event.clientX - pos.x, y: event.clientY - pos.y };
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+  };
+  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragging) return;
+    movedRef.current = true;
+    const next = { x: event.clientX - dragOffset.current.x, y: event.clientY - dragOffset.current.y };
+    setPos(next);
+  };
+  const onPointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragging) return;
+    setDragging(false);
+    try { (event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId); } catch { /* ignore */ }
+  };
+  const onContextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setMenuPos({ x: event.clientX, y: event.clientY });
+    setMenuOpen(true);
+  };
+  useEffect(() => {
+    if (!menuOpen) return;
+    const close = () => setMenuOpen(false);
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setMenuOpen(false); };
+    window.addEventListener('pointerdown', close);
+    window.addEventListener('keydown', onKey);
+    return () => { window.removeEventListener('pointerdown', close); window.removeEventListener('keydown', onKey); };
+  }, [menuOpen]);
+
+  if (mode === 'hidden') return null;
+
+  const size = large ? 128 : 72;
+  return <>
+    <div
+      className={`floating-pet ${dragging ? 'dragging' : ''} pet-mode-${mode} ${large ? 'large' : ''}`}
+      style={{ left: pos.x, top: pos.y, width: size, height: size }}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onContextMenu={onContextMenu}
+    >
+      <SpriteSheet character={character} animation={animation} size={size} animate={animate} loop/>
+      <span className="floating-pet-name">{character === 'kumo' ? 'Kumo' : 'Kitsu'}</span>
+    </div>
+    {menuOpen && (
+      <div className="floating-pet-menu" style={{ left: menuPos.x, top: menuPos.y }} onPointerDown={(e) => e.stopPropagation()}>
+        <button onClick={() => { onModeChange('hidden'); setMenuOpen(false); }}>Hide pet</button>
+        <button onClick={() => { onModeChange(mode === 'floating' ? 'embedded' : 'floating'); setMenuOpen(false); }}>{mode === 'floating' ? 'Dock to home' : 'Float freely'}</button>
+        <button onClick={() => { onCharacterChange(character === 'kumo' ? 'kitsu' : 'kumo'); setMenuOpen(false); }}>Switch character</button>
+        <button onClick={() => { setPos({ x: Math.max(20, window.innerWidth - 160), y: Math.max(20, window.innerHeight - 180) }); setMenuOpen(false); }}>Reset position</button>
+      </div>
+    )}
+  </>;
 }
 
 export default App;

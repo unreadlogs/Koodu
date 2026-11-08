@@ -1,5 +1,6 @@
 export * from './risk';
 export * from './routes';
+export * from './settings';
 export * from './agents';
 export * from './state';
 export * from './actions';

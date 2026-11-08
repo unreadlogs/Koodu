@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node ../../scripts/sync-assets.mjs && node ../../scripts/dev-server.mjs",
-    "start": "node ../../scripts/sync-assets.mjs && tsx src/index.ts",
+    "dev": "node ../../scripts/sync-assets.mjs server && node ../../scripts/dev-server.mjs",
+    "start": "node ../../scripts/sync-assets.mjs server && tsx src/index.ts",
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {

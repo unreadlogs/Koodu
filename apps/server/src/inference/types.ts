@@ -29,6 +29,7 @@ export type InferenceErrorCode =
   | 'not_configured'
   | 'timeout'
   | 'http_error'
+  | 'rate_limited'
   | 'invalid_output'
   | 'unavailable';
 
